@@ -32,7 +32,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           file: cmd/${{ matrix.image }}/Dockerfile
           push: true
-          tags: omniflow-oss/${{ matrix.image }}:nightly
+          tags: talelk/${{ matrix.image }}:nightly
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -45,7 +45,7 @@ jobs:
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-          repository: omniflow-oss/${{ matrix.image }}
+          repository: talelk/${{ matrix.image }}
 
   windows_images:
     name: windows images
@@ -61,8 +61,8 @@ jobs:
         run: |
           docker login -u $env:DOCKERHUB_USERNAME -p $env:DOCKERHUB_TOKEN
           docker build -f cmd/${{ matrix.image }}/Dockerfile.windows `
-            -t omniflow-oss/${{ matrix.image }}:nightly-windowsservercore .
-          docker image push --all-tags omniflow-oss/${{ matrix.image }}
+            -t talelk/${{ matrix.image }}:nightly-windowsservercore .
+          docker image push --all-tags talelk/${{ matrix.image }}
           docker logout
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
