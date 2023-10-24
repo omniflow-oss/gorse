@@ -83,9 +83,9 @@ jobs:
           file: cmd/${{ matrix.image }}/Dockerfile
           push: true
           tags: |
-            omniflow-oss/${{ matrix.image }}:latest
-            omniflow-oss/${{ matrix.image }}:${{ steps.get_version.outputs.major }}.${{ steps.get_version.outputs.minor }}
-            omniflow-oss/${{ matrix.image }}:${{ steps.get_version.outputs.version-without-v }}
+            talelk/${{ matrix.image }}:latest
+            talelk/${{ matrix.image }}:${{ steps.get_version.outputs.major }}.${{ steps.get_version.outputs.minor }}
+            talelk/${{ matrix.image }}:${{ steps.get_version.outputs.version-without-v }}
 
       - name: Build prerelease docker image
         if: github.event.release.prerelease == true
@@ -96,7 +96,7 @@ jobs:
           file: cmd/${{ matrix.image }}/Dockerfile
           push: true
           tags: |
-            omniflow-oss/${{ matrix.image }}:${{ steps.get_version.outputs.version-without-v }}
+            talelk/${{ matrix.image }}:${{ steps.get_version.outputs.version-without-v }}
 
   build-windows-images:
     name: build windows images
@@ -116,10 +116,10 @@ jobs:
         run: |
           docker login -u $env:DOCKERHUB_USERNAME -p $env:DOCKERHUB_TOKEN
           docker build -f cmd/${{ matrix.image }}/Dockerfile.windows `
-            -t omniflow-oss/${{ matrix.image }}:windowsservercore `
-            -t omniflow-oss/${{ matrix.image }}:${{ steps.get_version.outputs.major }}.${{ steps.get_version.outputs.minor }}-windowsservercore `
-            -t omniflow-oss/${{ matrix.image }}:${{ steps.get_version.outputs.version-without-v }}-windowsservercore .
-          docker image push --all-tags omniflow-oss/${{ matrix.image }}
+            -t talelk/${{ matrix.image }}:windowsservercore `
+            -t talelk/${{ matrix.image }}:${{ steps.get_version.outputs.major }}.${{ steps.get_version.outputs.minor }}-windowsservercore `
+            -t talelk/${{ matrix.image }}:${{ steps.get_version.outputs.version-without-v }}-windowsservercore .
+          docker image push --all-tags talelk/${{ matrix.image }}
           docker logout
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -130,8 +130,8 @@ jobs:
         run: |
           docker login -u $env:DOCKERHUB_USERNAME -p $env:DOCKERHUB_TOKEN
           docker build -f cmd/${{ matrix.image }}/Dockerfile.windows `
-            -t omniflow-oss/${{ matrix.image }}:${{ steps.get_version.outputs.version-without-v }}-windowsservercore .
-          docker image push --all-tags omniflow-oss/${{ matrix.image }}
+            -t talelk/${{ matrix.image }}:${{ steps.get_version.outputs.version-without-v }}-windowsservercore .
+          docker image push --all-tags talelk/${{ matrix.image }}
           docker logout
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
