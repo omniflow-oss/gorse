@@ -32,7 +32,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           file: cmd/${{ matrix.image }}/Dockerfile
           push: true
-          tags: zhenghaoz/${{ matrix.image }}:nightly
+          tags: omniflow-oss/${{ matrix.image }}:nightly
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -45,7 +45,7 @@ jobs:
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-          repository: zhenghaoz/${{ matrix.image }}
+          repository: omniflow-oss/${{ matrix.image }}
 
   windows_images:
     name: windows images
@@ -61,8 +61,8 @@ jobs:
         run: |
           docker login -u $env:DOCKERHUB_USERNAME -p $env:DOCKERHUB_TOKEN
           docker build -f cmd/${{ matrix.image }}/Dockerfile.windows `
-            -t zhenghaoz/${{ matrix.image }}:nightly-windowsservercore .
-          docker image push --all-tags zhenghaoz/${{ matrix.image }}
+            -t omniflow-oss/${{ matrix.image }}:nightly-windowsservercore .
+          docker image push --all-tags omniflow-oss/${{ matrix.image }}
           docker logout
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
