@@ -31,11 +31,8 @@ import (
 	"github.com/zhenghaoz/gorse/base/encoding"
 	"github.com/zhenghaoz/gorse/base/log"
 	"github.com/zhenghaoz/gorse/base/parallel"
-	"github.com/zhenghaoz/gorse/base/progress"
-	"github.com/zhenghaoz/gorse/base/sizeof"
 	"github.com/zhenghaoz/gorse/base/task"
 	"github.com/zhenghaoz/gorse/config"
-	"github.com/zhenghaoz/gorse/model"
 	"github.com/zhenghaoz/gorse/model/click"
 	"github.com/zhenghaoz/gorse/model/ranking"
 	"github.com/zhenghaoz/gorse/protocol"
@@ -60,11 +57,10 @@ type Master struct {
 	server.RestServer
 	grpcServer *grpc.Server
 
-	tracer         *progress.Tracer
-	remoteProgress sync.Map
-	jobsScheduler  *task.JobsScheduler
-	cacheFile      string
-	managedMode    bool
+	taskMonitor   *task.Monitor
+	jobsScheduler *task.JobsScheduler
+	cacheFile     string
+	managedMode   bool
 
 	// cluster meta cache
 	ttlCache       *ttlcache.Cache
@@ -115,13 +111,20 @@ func NewMaster(cfg *config.Config, cacheFile string, managedMode bool) *Master {
 	otel.SetTracerProvider(tp)
 	otel.SetErrorHandler(log.GetErrorHandler())
 	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
-	m := &Master{
+	// create task monitor
+	taskMonitor := task.NewTaskMonitor()
+	for _, taskName := range []string{TaskLoadDataset, TaskFindItemNeighbors, TaskFindUserNeighbors,
+		TaskFitRankingModel, TaskFitClickModel, TaskSearchRankingModel, TaskSearchClickModel,
+		TaskCacheGarbageCollection} {
+		taskMonitor.Pending(taskName)
+	}
+	return &Master{
 		nodesInfo: make(map[string]*Node),
 		// create task monitor
 		cacheFile:     cacheFile,
 		managedMode:   managedMode,
+		taskMonitor:   taskMonitor,
 		jobsScheduler: task.NewJobsScheduler(cfg.Master.NumJobs),
-		tracer:        progress.NewTracer("master"),
 		// default ranking model
 		rankingModelName: "bpr",
 		rankingModelSearcher: ranking.NewModelSearcher(
@@ -155,16 +158,6 @@ func NewMaster(cfg *config.Config, cacheFile string, managedMode bool) *Master {
 		loadDataChan: parallel.NewConditionChannel(),
 		triggerChan:  parallel.NewConditionChannel(),
 	}
-
-	// enable deep learning
-	if cfg.Experimental.EnableDeepLearning {
-		log.Logger().Debug("enable deep learning")
-		m.ClickModel = click.NewDeepFM(model.Params{
-			model.BatchSize: cfg.Experimental.DeepLearningBatchSize,
-		})
-	}
-
-	return m
 }
 
 // Serve starts the master node.
@@ -206,7 +199,7 @@ func (m *Master) Serve() {
 		RankingPrecision.Set(float64(m.clickScore.Precision))
 		RankingRecall.Set(float64(m.clickScore.Recall))
 		RankingAUC.Set(float64(m.clickScore.AUC))
-		MemoryInUseBytesVec.WithLabelValues("ranking_model").Set(float64(sizeof.DeepSize(m.ClickModel)))
+		MemoryInUseBytesVec.WithLabelValues("ranking_model").Set(float64(m.ClickModel.Bytes()))
 	}
 
 	// create cluster meta cache
@@ -236,6 +229,9 @@ func (m *Master) Serve() {
 	if err = m.CacheClient.Init(); err != nil {
 		log.Logger().Fatal("failed to init database", zap.Error(err))
 	}
+
+	m.RestServer.HiddenItemsManager = server.NewHiddenItemsManager(&m.RestServer)
+	m.RestServer.PopularItemsCache = server.NewPopularItemsCache(&m.RestServer)
 
 	if m.managedMode {
 		go m.RunManagedTasksLoop()
@@ -331,7 +327,7 @@ func (m *Master) RunPrivilegedTasksLoop() {
 				j := m.jobsScheduler.GetJobsAllocator(task.name())
 				defer m.jobsScheduler.Unregister(task.name())
 				j.Init()
-				if err := task.run(context.Background(), j); err != nil {
+				if err := task.run(j); err != nil {
 					log.Logger().Error("failed to run task", zap.String("task", task.name()), zap.Error(err))
 					return
 				}
@@ -369,8 +365,9 @@ func (m *Master) RunRagtagTasksLoop() {
 				defer m.jobsScheduler.Unregister(task.name())
 				j := m.jobsScheduler.GetJobsAllocator(task.name())
 				j.Init()
-				if err = task.run(context.Background(), j); err != nil {
+				if err = task.run(j); err != nil {
 					log.Logger().Error("failed to run task", zap.String("task", task.name()), zap.Error(err))
+					m.taskMonitor.Fail(task.name(), err.Error())
 				}
 			}(t)
 		}
@@ -440,7 +437,7 @@ func (m *Master) RunManagedTasksLoop() {
 					defer m.jobsScheduler.Unregister(task.name())
 					defer wg.Done()
 					j.Init()
-					if err := task.run(context.Background(), j); err != nil {
+					if err := task.run(j); err != nil {
 						log.Logger().Error("failed to run task", zap.String("task", task.name()), zap.Error(err))
 						return
 					}

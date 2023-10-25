@@ -15,7 +15,6 @@
 package parallel
 
 import (
-	"github.com/zhenghaoz/gorse/base"
 	"sync"
 
 	"github.com/juju/errors"
@@ -57,7 +56,6 @@ func Parallel(nJobs, nWorkers int, worker func(workerId, jobId int) error) error
 		for j := 0; j < nWorkers; j++ {
 			// start workers
 			go func(workerId int) {
-				defer base.CheckPanic()
 				defer wg.Done()
 				for {
 					// read job
@@ -96,7 +94,7 @@ func DynamicParallel(nJobs int, jobsAlloc *task.JobsAllocator, worker func(worke
 	// consumer
 	for {
 		exit := atomic.NewBool(true)
-		numJobs := jobsAlloc.AvailableJobs()
+		numJobs := jobsAlloc.AvailableJobs(nil)
 		var wg sync.WaitGroup
 		wg.Add(numJobs)
 		errs := make([]error, nJobs)
@@ -181,23 +179,4 @@ func BatchParallel(nJobs, nWorkers, batchSize int, worker func(workerId, beginJo
 		}
 	}
 	return nil
-}
-
-// Split a slice into n slices and keep the order of elements.
-func Split[T any](a []T, n int) [][]T {
-	if n > len(a) {
-		n = len(a)
-	}
-	minChunkSize := len(a) / n
-	maxChunkNum := len(a) % n
-	chunks := make([][]T, n)
-	for i, j := 0, 0; i < n; i++ {
-		chunkSize := minChunkSize
-		if i < maxChunkNum {
-			chunkSize++
-		}
-		chunks[i] = a[j : j+chunkSize]
-		j += chunkSize
-	}
-	return chunks
 }

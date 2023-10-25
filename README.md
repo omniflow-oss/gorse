@@ -1,4 +1,4 @@
-# Gorse Recommender System Engine Fork
+# Gorse Recommender System Engine
 
 <img width=160 src="assets/gorse.png"/>
 
@@ -89,13 +89,13 @@ curl http://127.0.0.1:8088/api/recommend/bob?n=10
 
 For more information：
 
-- Read [official documents](https://gorse.io/docs/master)
+- Read [official documents](https://gorse.io/docs)
 - Visit [official demo](https://gitrec.gorse.io/)
 - Discuss on [Discord](https://discord.gg/x6gAtNNkAE) or [GitHub Discussion](https://github.com/gorse-io/gorse/discussions)
 
 ## Architecture
 
-Gorse is a single-node training and distributed prediction recommender system. Gorse stores data in MySQL, MongoDB, or Postgres, with intermediate results cached in Redis, MySQL, MongoDB and Postgres.
+Gorse is a single-node training and distributed prediction recommender system. Gorse stores data in MySQL, MongoDB, Postgres, or ClickHouse, with intermediate results cached in Redis, MySQL, MongoDB and Postgres.
 
 1. The cluster consists of a master node, multiple worker nodes, and server nodes.
 1. The master node is responsible for model training, non-personalized item recommendation, configuration management, and membership management.

@@ -19,9 +19,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
-	"github.com/zhenghaoz/gorse/base/log"
 )
 
 var (
@@ -75,24 +73,4 @@ func (suite *MongoTestSuite) getMongoDB() *MongoDB {
 
 func TestMongo(t *testing.T) {
 	suite.Run(t, new(MongoTestSuite))
-}
-
-func BenchmarkMongo(b *testing.B) {
-	log.CloseLogger()
-	ctx := context.Background()
-	// create database
-	database, err := Open(mongoUri, "gorse_")
-	assert.NoError(b, err)
-	dbName := "gorse_cache_benchmark"
-	databaseComm := database.(*MongoDB)
-	_ = databaseComm.client.Database(dbName).Drop(ctx)
-	err = database.Close()
-	assert.NoError(b, err)
-	// create schema
-	database, err = Open(mongoUri+dbName+"?authSource=admin&connect=direct", "gorse_")
-	assert.NoError(b, err)
-	err = database.Init()
-	assert.NoError(b, err)
-	// benchmark
-	benchmark(b, database)
 }

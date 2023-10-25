@@ -15,14 +15,14 @@
 package master
 
 import (
-	"context"
-	"testing"
-
 	"github.com/stretchr/testify/assert"
 	"github.com/zhenghaoz/gorse/base"
 	"github.com/zhenghaoz/gorse/model"
 	"github.com/zhenghaoz/gorse/model/click"
 	"github.com/zhenghaoz/gorse/model/ranking"
+	"os"
+	"path/filepath"
+	"testing"
 )
 
 func newRankingDataset() (*ranking.DataSet, *ranking.DataSet) {
@@ -42,7 +42,8 @@ func newClickDataset() (*click.Dataset, *click.Dataset) {
 
 func TestLocalCache(t *testing.T) {
 	// delete test file if exists
-	path := t.TempDir()
+	path := filepath.Join(os.TempDir(), "TestLocalCache_Master")
+	_ = os.Remove(path)
 
 	// load non-existed file
 	cache, err := LoadLocalCache(path)
@@ -59,7 +60,7 @@ func TestLocalCache(t *testing.T) {
 	// write and load
 	trainSet, testSet := newRankingDataset()
 	bpr := ranking.NewBPR(model.Params{model.NEpochs: 0})
-	bpr.Fit(context.Background(), trainSet, testSet, nil)
+	bpr.Fit(trainSet, testSet, nil)
 	cache.RankingModel = bpr
 	cache.RankingModelName = "bpr"
 	cache.RankingModelVersion = 123
@@ -67,7 +68,7 @@ func TestLocalCache(t *testing.T) {
 
 	train, test := newClickDataset()
 	fm := click.NewFM(click.FMClassification, model.Params{model.NEpochs: 0})
-	fm.Fit(context.Background(), train, test, nil)
+	fm.Fit(train, test, nil)
 	cache.ClickModel = fm
 	cache.ClickModelVersion = 456
 	cache.ClickModelScore = click.Score{Precision: 1, RMSE: 100, Task: click.FMClassification}
@@ -82,4 +83,7 @@ func TestLocalCache(t *testing.T) {
 	assert.NotNil(t, read.ClickModel)
 	assert.Equal(t, int64(456), read.ClickModelVersion)
 	assert.Equal(t, click.Score{Precision: 1, RMSE: 100, Task: click.FMClassification}, read.ClickModelScore)
+
+	// delete test file
+	assert.NoError(t, os.Remove(path))
 }

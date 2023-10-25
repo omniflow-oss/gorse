@@ -15,11 +15,10 @@
 package master
 
 import (
+	"github.com/stretchr/testify/assert"
+	"github.com/zhenghaoz/gorse/server"
 	"testing"
 	"time"
-
-	"github.com/stretchr/testify/assert"
-	"github.com/zhenghaoz/gorse/storage/cache"
 )
 
 func TestOnlineEvaluator(t *testing.T) {
@@ -46,7 +45,7 @@ func TestOnlineEvaluator(t *testing.T) {
 	evaluator2.Positive("star", 2, 3, time.Date(2005, 6, 16, 0, 0, 0, 0, time.UTC))
 	evaluator2.Positive("fork", 3, 3, time.Date(2005, 6, 16, 0, 0, 0, 0, time.UTC))
 	result = evaluator2.Evaluate()
-	assert.ElementsMatch(t, []cache.TimeSeriesPoint{
+	assert.ElementsMatch(t, []server.Measurement{
 		{"PositiveFeedbackRate/star", time.Date(2005, 6, 16, 0, 0, 0, 0, time.UTC), 0},
 		{"PositiveFeedbackRate/star", time.Date(2005, 6, 15, 0, 0, 0, 0, time.UTC), 0.35},
 		{"PositiveFeedbackRate/like", time.Date(2005, 6, 16, 0, 0, 0, 0, time.UTC), 0},

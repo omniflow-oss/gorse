@@ -11,20 +11,35 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
-package parallel
+package data
 
 import (
 	"testing"
 
-	"github.com/stretchr/testify/assert"
+	"github.com/alicebob/miniredis/v2"
+	"github.com/stretchr/testify/suite"
+	"github.com/zhenghaoz/gorse/storage"
 )
 
-func TestAsync(t *testing.T) {
-	var a int
-	future := Async(func() {
-		a = 1
-	})
-	future.Wait()
-	assert.Equal(t, 1, a)
+type RedisTestSuite struct {
+	baseTestSuite
+	server *miniredis.Miniredis
+}
+
+func (suite *RedisTestSuite) SetupSuite() {
+	var err error
+	suite.server, err = miniredis.Run()
+	suite.NoError(err)
+	suite.Database, err = Open(storage.RedisPrefix+suite.server.Addr(), "")
+	suite.NoError(err)
+}
+
+func (suite *RedisTestSuite) TearDownSuite() {
+	err := suite.Database.Close()
+	suite.NoError(err)
+	suite.server.Close()
+}
+
+func TestRedis(t *testing.T) {
+	suite.Run(t, new(RedisTestSuite))
 }

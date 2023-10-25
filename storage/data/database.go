@@ -16,16 +16,16 @@ package data
 
 import (
 	"context"
-	"encoding/json"
-	"reflect"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/XSAM/otelsql"
+	"github.com/dzwvip/oracle"
+	"github.com/go-redis/redis/v9"
 	"github.com/juju/errors"
 	"github.com/samber/lo"
-	"github.com/zhenghaoz/gorse/base/jsonutil"
 	"github.com/zhenghaoz/gorse/base/log"
 	"github.com/zhenghaoz/gorse/storage"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -33,6 +33,7 @@ import (
 	"go.mongodb.org/mongo-driver/x/mongo/driver/connstring"
 	"go.opentelemetry.io/contrib/instrumentation/go.mongodb.org/mongo-driver/mongo/otelmongo"
 	semconv "go.opentelemetry.io/otel/semconv/v1.12.0"
+	"gorm.io/driver/clickhouse"
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/driver/sqlite"
@@ -41,70 +42,20 @@ import (
 	"moul.io/zapgorm2"
 )
 
-const (
-	maxIdleConns = 64
-	maxOpenConns = 64
-	maxLifetime  = time.Minute
-)
-
 var (
 	ErrUserNotExist = errors.NotFoundf("user")
 	ErrItemNotExist = errors.NotFoundf("item")
 	ErrNoDatabase   = errors.NotAssignedf("database")
 )
 
-// ValidateLabels checks if labels are valid. Labels are valid if consists of:
-// - []string			slice of strings
-// - []float64			slice of numbers
-// - map[string]any		map of strings to valid labels or float64
-func ValidateLabels(o any) error {
-	if o == nil {
-		return nil
-	}
-	switch labels := o.(type) {
-	case []any: // must be []string or []float64
-		if len(labels) == 0 {
-			return nil
-		}
-		switch labels[0].(type) {
-		case string:
-			for _, val := range labels {
-				if _, ok := val.(string); !ok {
-					return errors.Errorf("unsupported labels: %v", jsonutil.MustMarshal(labels))
-				}
-			}
-		case json.Number:
-			for _, val := range labels {
-				if _, ok := val.(json.Number); !ok {
-					return errors.Errorf("unsupported labels: %v", jsonutil.MustMarshal(labels))
-				}
-			}
-		default:
-			return errors.Errorf("unsupported labels: %v", jsonutil.MustMarshal(labels))
-		}
-		return nil
-	case map[string]any:
-		for _, val := range labels {
-			if err := ValidateLabels(val); err != nil {
-				return err
-			}
-		}
-		return nil
-	case string, json.Number:
-		return nil
-	default:
-		return errors.Errorf("unsupported type in labels: %v", reflect.TypeOf(labels))
-	}
-}
-
 // Item stores meta data about item.
 type Item struct {
-	ItemId     string    `gorm:"primaryKey" mapstructure:"item_id"`
-	IsHidden   bool      `mapstructure:"is_hidden"`
-	Categories []string  `gorm:"serializer:json" mapstructure:"categories"`
-	Timestamp  time.Time `gorm:"column:time_stamp" mapstructure:"timestamp"`
-	Labels     any       `gorm:"serializer:json" mapstructure:"labels"`
-	Comment    string    `mapsstructure:"comment"`
+	ItemId     string `gorm:"primaryKey"`
+	IsHidden   bool
+	Categories []string `gorm:"serializer:json"`
+	Timestamp  time.Time
+	Labels     []string `gorm:"serializer:json"`
+	Comment    string
 }
 
 // ItemPatch is the modification on an item.
@@ -112,37 +63,37 @@ type ItemPatch struct {
 	IsHidden   *bool
 	Categories []string
 	Timestamp  *time.Time
-	Labels     any
+	Labels     []string
 	Comment    *string
 }
 
 // User stores meta data about user.
 type User struct {
-	UserId    string   `gorm:"primaryKey" mapstructure:"user_id"`
-	Labels    any      `gorm:"serializer:json" mapstructure:"labels"`
-	Subscribe []string `gorm:"serializer:json" mapstructure:"subscribe"`
-	Comment   string   `mapstructure:"comment"`
+	UserId    string   `gorm:"primaryKey"`
+	Labels    []string `gorm:"serializer:json"`
+	Subscribe []string `gorm:"serializer:json"`
+	Comment   string
 }
 
 // UserPatch is the modification on a user.
 type UserPatch struct {
-	Labels    any
+	Labels    []string
 	Subscribe []string
 	Comment   *string
 }
 
 // FeedbackKey identifies feedback.
 type FeedbackKey struct {
-	FeedbackType string `gorm:"column:feedback_type" mapstructure:"feedback_type"`
-	UserId       string `gorm:"column:user_id" mapstructure:"user_id"`
-	ItemId       string `gorm:"column:item_id" mapstructure:"item_id"`
+	FeedbackType string `gorm:"column:feedback_type"`
+	UserId       string `gorm:"column:user_id"`
+	ItemId       string `gorm:"column:item_id"`
 }
 
 // Feedback stores feedback.
 type Feedback struct {
-	FeedbackKey `gorm:"embedded" mapstructure:",squash"`
-	Timestamp   time.Time `gorm:"column:time_stamp" mapsstructure:"timestamp"`
-	Comment     string    `gorm:"column:comment" mapsstructure:"comment"`
+	FeedbackKey `gorm:"embedded"`
+	Timestamp   time.Time `gorm:"column:time_stamp"`
+	Comment     string    `gorm:"column:comment"`
 }
 
 // SortFeedbacks sorts feedback from latest to oldest.
@@ -164,65 +115,11 @@ func (sorter feedbackSorter) Swap(i, j int) {
 	sorter[i], sorter[j] = sorter[j], sorter[i]
 }
 
-type ScanOptions struct {
-	BeginUserId   *string
-	EndUserId     *string
-	BeginTime     *time.Time
-	EndTime       *time.Time
-	FeedbackTypes []string
-}
-
-type ScanOption func(options *ScanOptions)
-
-// WithBeginUserId sets the begin user id. The begin user id is included in the result.
-func WithBeginUserId(userId string) ScanOption {
-	return func(options *ScanOptions) {
-		options.BeginUserId = &userId
-	}
-}
-
-// WithEndUserId sets the end user id. The end user id is included in the result.
-func WithEndUserId(userId string) ScanOption {
-	return func(options *ScanOptions) {
-		options.EndUserId = &userId
-	}
-}
-
-// WithBeginTime sets the begin time. The begin time is included in the result.
-func WithBeginTime(t time.Time) ScanOption {
-	return func(options *ScanOptions) {
-		options.BeginTime = &t
-	}
-}
-
-// WithEndTime sets the end time. The end time is included in the result.
-func WithEndTime(t time.Time) ScanOption {
-	return func(options *ScanOptions) {
-		options.EndTime = &t
-	}
-}
-
-// WithFeedbackTypes sets the feedback types.
-func WithFeedbackTypes(feedbackTypes ...string) ScanOption {
-	return func(options *ScanOptions) {
-		options.FeedbackTypes = feedbackTypes
-	}
-}
-
-func NewScanOptions(opts ...ScanOption) ScanOptions {
-	options := ScanOptions{}
-	for _, opt := range opts {
-		if opt != nil {
-			opt(&options)
-		}
-	}
-	return options
-}
-
 type Database interface {
 	Init() error
 	Ping() error
 	Close() error
+	Optimize() error
 	Purge() error
 	BatchInsertItems(ctx context.Context, items []Item) error
 	BatchGetItems(ctx context.Context, itemIds []string) ([]Item, error)
@@ -243,7 +140,7 @@ type Database interface {
 	GetFeedback(ctx context.Context, cursor string, n int, beginTime, endTime *time.Time, feedbackTypes ...string) (string, []Feedback, error)
 	GetUserStream(ctx context.Context, batchSize int) (chan []User, chan error)
 	GetItemStream(ctx context.Context, batchSize int, timeLimit *time.Time) (chan []Item, chan error)
-	GetFeedbackStream(ctx context.Context, batchSize int, options ...ScanOption) (chan []Feedback, chan error)
+	GetFeedbackStream(ctx context.Context, batchSize int, beginTime, endTime *time.Time, feedbackTypes ...string) (chan []Feedback, chan error)
 }
 
 // Open a connection to a database.
@@ -289,10 +186,33 @@ func Open(path, tablePrefix string) (Database, error) {
 		); err != nil {
 			return nil, errors.Trace(err)
 		}
-		database.client.SetMaxIdleConns(maxIdleConns)
-		database.client.SetMaxOpenConns(maxOpenConns)
-		database.client.SetConnMaxLifetime(maxLifetime)
 		database.gormDB, err = gorm.Open(postgres.New(postgres.Config{Conn: database.client}), storage.NewGORMConfig(tablePrefix))
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		return database, nil
+	} else if strings.HasPrefix(path, storage.ClickhousePrefix) || strings.HasPrefix(path, storage.CHHTTPPrefix) || strings.HasPrefix(path, storage.CHHTTPSPrefix) {
+		// replace schema
+		parsed, err := url.Parse(path)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		if strings.HasPrefix(path, storage.CHHTTPSPrefix) {
+			parsed.Scheme = "https"
+		} else {
+			parsed.Scheme = "http"
+		}
+		uri := parsed.String()
+		database := new(SQLDatabase)
+		database.driver = ClickHouse
+		database.TablePrefix = storage.TablePrefix(tablePrefix)
+		if database.client, err = otelsql.Open("chhttp", uri,
+			otelsql.WithAttributes(semconv.DBSystemKey.String("clickhouse")),
+			otelsql.WithSpanOptions(otelsql.SpanOptions{DisableErrSkip: true}),
+		); err != nil {
+			return nil, errors.Trace(err)
+		}
+		database.gormDB, err = gorm.Open(clickhouse.New(clickhouse.Config{Conn: database.client}), storage.NewGORMConfig(tablePrefix))
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
@@ -315,19 +235,19 @@ func Open(path, tablePrefix string) (Database, error) {
 		}
 		return database, nil
 	} else if strings.HasPrefix(path, storage.SQLitePrefix) {
-		dataSourceName := path[len(storage.SQLitePrefix):]
 		// append parameters
-		if dataSourceName, err = storage.AppendURLParams(dataSourceName, []lo.Tuple2[string, string]{
+		if path, err = storage.AppendURLParams(path, []lo.Tuple2[string, string]{
 			{"_pragma", "busy_timeout(10000)"},
 			{"_pragma", "journal_mode(wal)"},
 		}); err != nil {
 			return nil, errors.Trace(err)
 		}
 		// connect to database
+		name := path[len(storage.SQLitePrefix):]
 		database := new(SQLDatabase)
 		database.driver = SQLite
 		database.TablePrefix = storage.TablePrefix(tablePrefix)
-		if database.client, err = otelsql.Open("sqlite", dataSourceName,
+		if database.client, err = otelsql.Open("sqlite", name,
 			otelsql.WithAttributes(semconv.DBSystemSqlite),
 			otelsql.WithSpanOptions(otelsql.SpanOptions{DisableErrSkip: true}),
 		); err != nil {
@@ -342,6 +262,30 @@ func Open(path, tablePrefix string) (Database, error) {
 			IgnoreRecordNotFoundError: false,
 		}
 		database.gormDB, err = gorm.Open(sqlite.Dialector{Conn: database.client}, gormConfig)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		return database, nil
+	} else if strings.HasPrefix(path, storage.RedisPrefix) {
+		addr := path[len(storage.RedisPrefix):]
+		database := new(Redis)
+		database.client = redis.NewClient(&redis.Options{Addr: addr})
+		if tablePrefix != "" {
+			panic("table prefix is not supported for redis")
+		}
+		log.Logger().Warn("redis is used for testing only")
+		return database, nil
+	} else if strings.HasPrefix(path, storage.OraclePrefix) {
+		database := new(SQLDatabase)
+		database.driver = Oracle
+		database.TablePrefix = storage.TablePrefix(tablePrefix)
+		if database.client, err = otelsql.Open("oracle", path,
+			otelsql.WithAttributes(semconv.DBSystemOracle),
+			otelsql.WithSpanOptions(otelsql.SpanOptions{DisableErrSkip: true}),
+		); err != nil {
+			return nil, errors.Trace(err)
+		}
+		database.gormDB, err = gorm.Open(oracle.New(oracle.Config{Conn: database.client}), storage.NewGORMConfig(tablePrefix))
 		if err != nil {
 			return nil, errors.Trace(err)
 		}

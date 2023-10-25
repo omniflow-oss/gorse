@@ -23,12 +23,12 @@ import (
 	"sort"
 	"strings"
 
-	mapset "github.com/deckarep/golang-set/v2"
+	"github.com/scylladb/go-set/strset"
 	"github.com/spf13/cobra"
 	"modernc.org/cc/v3"
 )
 
-var supportedTypes = mapset.NewSet("int64_t", "long")
+var supportedTypes = strset.New("int64_t", "long")
 
 type TranslateUnit struct {
 	Source     string
@@ -150,10 +150,7 @@ func (t *TranslateUnit) Translate() error {
 	if err != nil {
 		return err
 	}
-	dump, err := runCommand("objdump", "-d", t.Object, "--insn-width", "16")
-	if err != nil {
-		return err
-	}
+	dump, _ := runCommand("objdump", "-d", t.Object, "--insn-width", "16")
 	err = parseObjectDump(dump, assembly)
 	if err != nil {
 		return err
@@ -251,7 +248,7 @@ func (t *TranslateUnit) convertFunctionParameters(params *cc.ParameterList) ([]s
 	paramName := declaration.Declarator.DirectDeclarator.Token.Value
 	paramType := declaration.DeclarationSpecifiers.TypeSpecifier.Token.Value
 	isPointer := declaration.Declarator.Pointer != nil
-	if !isPointer && !supportedTypes.Contains(paramType.String()) {
+	if !isPointer && !supportedTypes.Has(paramType.String()) {
 		position := declaration.Position()
 		return nil, fmt.Errorf("%v:%v:%v: error: unsupported type: %v\n",
 			position.Filename, position.Line+t.Offset, position.Column, paramType)
@@ -298,8 +295,6 @@ var command = &cobra.Command{
 		for _, m := range machineOptions {
 			options = append(options, "-m"+m)
 		}
-		extraOptions, _ := cmd.PersistentFlags().GetStringSlice("extra-option")
-		options = append(options, extraOptions...)
 		optimizeLevel, _ := cmd.PersistentFlags().GetInt("optimize-level")
 		options = append(options, fmt.Sprintf("-O%d", optimizeLevel))
 		file := NewTranslateUnit(args[0], output, options...)
@@ -313,7 +308,6 @@ var command = &cobra.Command{
 func init() {
 	command.PersistentFlags().StringP("output", "o", "", "output directory of generated files")
 	command.PersistentFlags().StringSliceP("machine-option", "m", nil, "machine option for clang")
-	command.PersistentFlags().StringSliceP("extra-option", "e", nil, "extra option for clang")
 	command.PersistentFlags().IntP("optimize-level", "O", 0, "optimization level for clang")
 }
 

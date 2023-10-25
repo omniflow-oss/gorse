@@ -1,26 +1,18 @@
-# syntax = docker/dockerfile:1-experimental
-
 ############################
 # STEP 1 build executable binary
 ############################
-FROM golang:1.21
+FROM golang:1.20
 
-WORKDIR /src
+COPY . gorse
 
-COPY go.* ./
-
-RUN go mod download
-
-COPY . ./
-
-RUN --mount=type=cache,target=/root/.cache/go-build \
-    cd cmd/gorse-server && \
+RUN cd gorse/cmd/gorse-server && \
     CGO_ENABLED=0 go build -ldflags=" \
        -X 'github.com/zhenghaoz/gorse/cmd/version.Version=$(git describe --tags $(git rev-parse HEAD))' \
        -X 'github.com/zhenghaoz/gorse/cmd/version.GitCommit=$(git rev-parse HEAD)' \
-       -X 'github.com/zhenghaoz/gorse/cmd/version.BuildTime=$(date)'" .
+       -X 'github.com/zhenghaoz/gorse/cmd/version.BuildTime=$(date)'" . && \
+    mv gorse-server /usr/bin
 
-RUN /src/cmd/gorse-server/gorse-server --version
+RUN /usr/bin/gorse-server --version
 
 ############################
 # STEP 2 build a small image
@@ -29,7 +21,7 @@ FROM scratch
 
 COPY --from=0 /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 
-COPY --from=0 /src/cmd/gorse-server/gorse-server /usr/bin/gorse-server
+COPY --from=0 /usr/bin/gorse-server /usr/bin/gorse-server
 
 ENV USER root
 

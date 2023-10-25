@@ -22,6 +22,11 @@ import (
 // NoDatabase means that no database used.
 type NoDatabase struct{}
 
+// Optimize is used by ClickHouse only.
+func (NoDatabase) Optimize() error {
+	return ErrNoDatabase
+}
+
 // Init method of NoDatabase returns ErrNoDatabase.
 func (NoDatabase) Init() error {
 	return ErrNoDatabase
@@ -140,7 +145,7 @@ func (NoDatabase) GetFeedback(_ context.Context, _ string, _ int, _, _ *time.Tim
 }
 
 // GetFeedbackStream method of NoDatabase returns ErrNoDatabase.
-func (NoDatabase) GetFeedbackStream(_ context.Context, _ int, _ ...ScanOption) (chan []Feedback, chan error) {
+func (NoDatabase) GetFeedbackStream(_ context.Context, _ int, _, _ *time.Time, _ ...string) (chan []Feedback, chan error) {
 	feedbackChan := make(chan []Feedback, bufSize)
 	errChan := make(chan error, 1)
 	go func() {

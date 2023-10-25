@@ -16,83 +16,29 @@ package click
 
 import (
 	"bufio"
-	"encoding/json"
+	"github.com/juju/errors"
+	"github.com/scylladb/go-set"
+	"github.com/zhenghaoz/gorse/base"
+	"github.com/zhenghaoz/gorse/model"
+	"modernc.org/mathutil"
 	"os"
 	"strconv"
 	"strings"
-
-	mapset "github.com/deckarep/golang-set/v2"
-	"github.com/juju/errors"
-	"github.com/samber/lo"
-	"github.com/zhenghaoz/gorse/base"
-	"github.com/zhenghaoz/gorse/base/jsonutil"
-	"github.com/zhenghaoz/gorse/model"
-	"modernc.org/mathutil"
 )
-
-type Feature struct {
-	Name      string
-	Value     float32
-	Embedding []float32
-}
-
-func ConvertLabelsToFeatures(o any) []Feature {
-	features := make([]Feature, 0)
-	return convertLabelsToFeatures(features, "", o)
-}
-
-func convertLabelsToFeatures(result []Feature, prefix string, o any) []Feature {
-	if o == nil {
-		return nil
-	}
-	switch labels := o.(type) {
-	case []any:
-		if len(labels) == 0 {
-			return nil
-		}
-		switch labels[0].(type) {
-		case string:
-			for _, val := range labels {
-				if s, ok := val.(string); ok {
-					result = append(result, Feature{
-						Name:  prefix + s,
-						Value: 1,
-					})
-				} else {
-					panic("unsupported labels: " + jsonutil.MustMarshal(labels))
-				}
-			}
-		}
-	case map[string]any:
-		for key, val := range labels {
-			result = convertLabelsToFeatures(result, prefix+key+".", val)
-		}
-	case string:
-		result = append(result, Feature{
-			Name:  prefix + labels,
-			Value: 1,
-		})
-	case json.Number:
-		value, _ := labels.Float64()
-		result = append(result, Feature{
-			Name:  prefix,
-			Value: float32(value),
-		})
-	}
-	return result
-}
 
 // Dataset for click-through-rate models.
 type Dataset struct {
 	Index UnifiedIndex
 
-	UserFeatures    [][]lo.Tuple2[int32, float32] // features of users
-	ItemFeatures    [][]lo.Tuple2[int32, float32] // features of items
-	ContextFeatures [][]lo.Tuple2[int32, float32] // features of context
+	UserFeatures [][]int32 // features of users
+	ItemFeatures [][]int32 // features of items
 
-	Users  base.Array[int32]
-	Items  base.Array[int32]
-	Target base.Array[float32]
+	Users       base.Array[int32]
+	Items       base.Array[int32]
+	CtxFeatures [][]int32
+	CtxValues   [][]float32
+	NormValues  base.Array[float32]
+	Target      base.Array[float32]
 
 	PositiveCount int
 	NegativeCount int
@@ -108,71 +54,84 @@ func (dataset *Dataset) ItemCount() int {
 	return int(dataset.Index.CountItems())
 }
 
+func (dataset *Dataset) Bytes() int {
+	var bytes uintptr
+	bytes += uintptr(dataset.Index.Bytes())
+	bytes += uintptr(dataset.Users.Bytes())
+	bytes += uintptr(dataset.Items.Bytes())
+	bytes += uintptr(dataset.NormValues.Bytes())
+	bytes += uintptr(dataset.Target.Bytes())
+	return int(bytes)
+}
+
 // Count returns the number of samples.
 func (dataset *Dataset) Count() int {
 	if dataset.Users.Len() != dataset.Items.Len() {
 		panic("dataset.Users.Len() != dataset.Items.Len()")
 	}
+	if dataset.Users.Len() != dataset.NormValues.Len() {
+		panic("dataset.Users.Len() != dataset.NormValues.Len()")
+	}
+	if len(dataset.CtxFeatures) != len(dataset.CtxValues) {
+		panic("len(dataset.CtxFeatures) != len(dataset.CtxValues)")
+	}
 	if dataset.Users.Len() > 0 && dataset.Users.Len() != dataset.Target.Len() {
 		panic("dataset.Users.Len() != dataset.Target.Len()")
 	}
-	if dataset.ContextFeatures != nil && len(dataset.ContextFeatures) != dataset.Target.Len() {
-		panic("len(dataset.ContextFeatures) != len(dataset.Target)")
+	if dataset.CtxFeatures != nil && len(dataset.CtxFeatures) != dataset.Target.Len() {
+		panic("len(dataset.CtxFeatures) != len(dataset.Target)")
 	}
 	return dataset.Target.Len()
 }
 
 // Get returns the i-th sample.
 func (dataset *Dataset) Get(i int) ([]int32, []float32, float32) {
-	var (
-		indices  []int32
-		values   []float32
-		position int32
-	)
+	var features []int32
+	var values []float32
+	var position int32
 	// append user id
 	if dataset.Users.Len() > 0 {
-		indices = append(indices, dataset.Users.Get(i))
+		features = append(features, dataset.Users.Get(i))
 		values = append(values, 1)
 		position += int32(dataset.UserCount())
 	}
 	// append item id
 	if dataset.Items.Len() > 0 {
-		indices = append(indices, position+dataset.Items.Get(i))
+		features = append(features, position+dataset.Items.Get(i))
 		values = append(values, 1)
 		position += int32(dataset.ItemCount())
 	}
-	// append user indices
+	// append user features
 	if dataset.Users.Len() > 0 {
 		userFeatures := dataset.UserFeatures[dataset.Users.Get(i)]
 		for _, feature := range userFeatures {
-			indices = append(indices, position+feature.A)
-			values = append(values, feature.B)
+			features = append(features, position+feature)
 		}
+		values = append(values, base.RepeatFloat32s(len(userFeatures), dataset.NormValues.Get(i))...)
 		position += dataset.Index.CountUserLabels()
 	}
-	// append item indices
+	// append item features
 	if dataset.Items.Len() > 0 {
 		itemFeatures := dataset.ItemFeatures[dataset.Items.Get(i)]
 		for _, feature := range itemFeatures {
-			indices = append(indices, position+feature.A)
-			values = append(values, feature.B)
+			features = append(features, position+feature)
 		}
+		values = append(values, base.RepeatFloat32s(len(itemFeatures), dataset.NormValues.Get(i))...)
 	}
-	// append context indices
-	if dataset.ContextFeatures != nil {
-		contextIndices, contextValues := lo.Unzip2(dataset.ContextFeatures[i])
-		indices = append(indices, contextIndices...)
-		values = append(values, contextValues...)
+	// append context features
+	if dataset.CtxFeatures != nil {
+		features = append(features, dataset.CtxFeatures[i]...)
+		values = append(values, dataset.CtxValues[i]...)
 	}
-	return indices, values, dataset.Target.Get(i)
+	return features, values, dataset.Target.Get(i)
 }
 
 // LoadLibFMFile loads libFM format file.
-func LoadLibFMFile(path string) (features [][]lo.Tuple2[int32, float32], targets base.Array[float32], maxLabel int32, err error) {
+func LoadLibFMFile(path string) (features [][]int32, values [][]float32, targets base.Array[float32], maxLabel int32, err error) {
 	// open file
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, base.Array[float32]{}, 0, errors.Trace(err)
+		return nil, nil, base.Array[float32]{}, 0, errors.Trace(err)
 	}
 	defer file.Close()
 	// read lines
@@ -183,11 +142,12 @@ func LoadLibFMFile(path string) (features [][]lo.Tuple2[int32, float32], targets
 		// fetch target
 		target, err := strconv.ParseFloat(fields[0], 32)
 		if err != nil {
-			return nil, base.Array[float32]{}, 0, errors.Trace(err)
+			return nil, nil, base.Array[float32]{}, 0, errors.Trace(err)
 		}
 		targets.Append(float32(target))
 		// fetch features
-		lineFeatures := make([]lo.Tuple2[int32, float32], 0, len(fields[1:]))
+		lineFeatures := make([]int32, 0, len(fields[1:]))
+		lineValues := make([]float32, 0, len(fields[1:]))
 		for _, field := range fields[1:] {
 			if len(strings.TrimSpace(field)) > 0 {
 				kv := strings.Split(field, ":")
@@ -195,24 +155,24 @@ func LoadLibFMFile(path string) (features [][]lo.Tuple2[int32, float32], targets
 				// append feature
 				feature, err := strconv.Atoi(k)
 				if err != nil {
-					return nil, base.Array[float32]{}, 0, errors.Trace(err)
+					return nil, nil, base.Array[float32]{}, 0, errors.Trace(err)
 				}
+				lineFeatures = append(lineFeatures, int32(feature))
+				// append value
 				value, err := strconv.ParseFloat(v, 32)
 				if err != nil {
-					return nil, base.Array[float32]{}, 0, errors.Trace(err)
+					return nil, nil, base.Array[float32]{}, 0, errors.Trace(err)
 				}
-				lineFeatures = append(lineFeatures, lo.Tuple2[int32, float32]{
-					A: int32(feature),
-					B: float32(value),
-				})
-				maxLabel = mathutil.MaxInt32Val(maxLabel, int32(feature))
+				lineValues = append(lineValues, float32(value))
+				maxLabel = mathutil.MaxInt32Val(maxLabel, lineFeatures...)
 			}
 		}
 		features = append(features, lineFeatures)
+		values = append(values, lineValues)
 	}
 	// check error
 	if err = scanner.Err(); err != nil {
-		return nil, base.Array[float32]{}, 0, errors.Trace(err)
+		return nil, nil, base.Array[float32]{}, 0, errors.Trace(err)
 	}
 	return
 }
@@ -225,10 +185,10 @@ func LoadDataFromBuiltIn(name string) (train, test *Dataset, err error) {
 	}
 	train, test = &Dataset{}, &Dataset{}
 	var trainMaxLabel, testMaxLabel int32
-	if train.ContextFeatures, train.Target, trainMaxLabel, err = LoadLibFMFile(trainFilePath); err != nil {
+	if train.CtxFeatures, train.CtxValues, train.Target, trainMaxLabel, err = LoadLibFMFile(trainFilePath); err != nil {
 		return nil, nil, err
 	}
-	if test.ContextFeatures, test.Target, testMaxLabel, err = LoadLibFMFile(testFilePath); err != nil {
+	if test.CtxFeatures, test.CtxValues, test.Target, testMaxLabel, err = LoadLibFMFile(testFilePath); err != nil {
 		return nil, nil, err
 	}
 	unifiedIndex := NewUnifiedDirectIndex(mathutil.MaxInt32(trainMaxLabel, testMaxLabel) + 1)
@@ -253,15 +213,19 @@ func (dataset *Dataset) Split(ratio float32, seed int64) (*Dataset, *Dataset) {
 	// split by random
 	numTestSize := int(float32(dataset.Count()) * ratio)
 	rng := base.NewRandomGenerator(seed)
-	sampledIndex := mapset.NewSet(rng.Sample(0, dataset.Count(), numTestSize)...)
+	sampledIndex := set.NewIntSet(rng.Sample(0, dataset.Count(), numTestSize)...)
 	for i := 0; i < dataset.Target.Len(); i++ {
-		if sampledIndex.Contains(i) {
+		if sampledIndex.Has(i) {
 			// add samples into test set
 			testSet.Users.Append(dataset.Users.Get(i))
 			testSet.Items.Append(dataset.Items.Get(i))
-			if dataset.ContextFeatures != nil {
-				testSet.ContextFeatures = append(testSet.ContextFeatures, dataset.ContextFeatures[i])
+			if dataset.CtxFeatures != nil {
+				testSet.CtxFeatures = append(testSet.CtxFeatures, dataset.CtxFeatures[i])
 			}
+			if dataset.CtxValues != nil {
+				testSet.CtxValues = append(testSet.CtxValues, dataset.CtxValues[i])
+			}
+			testSet.NormValues.Append(dataset.NormValues.Get(i))
 			testSet.Target.Append(dataset.Target.Get(i))
 			if dataset.Target.Get(i) > 0 {
 				testSet.PositiveCount++
@@ -272,9 +236,13 @@ func (dataset *Dataset) Split(ratio float32, seed int64) (*Dataset, *Dataset) {
 			// add samples into train set
 			trainSet.Users.Append(dataset.Users.Get(i))
 			trainSet.Items.Append(dataset.Items.Get(i))
-			if dataset.ContextFeatures != nil {
-				trainSet.ContextFeatures = append(trainSet.ContextFeatures, dataset.ContextFeatures[i])
+			if dataset.CtxFeatures != nil {
+				trainSet.CtxFeatures = append(trainSet.CtxFeatures, dataset.CtxFeatures[i])
 			}
+			if dataset.CtxValues != nil {
+				trainSet.CtxValues = append(trainSet.CtxValues, dataset.CtxValues[i])
+			}
+			trainSet.NormValues.Append(dataset.NormValues.Get(i))
 			trainSet.Target.Append(dataset.Target.Get(i))
 			if dataset.Target.Get(i) > 0 {
 				trainSet.PositiveCount++

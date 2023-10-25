@@ -15,16 +15,14 @@
 package search
 
 import (
-	"context"
 	"fmt"
-	"reflect"
-	"sort"
-
 	"github.com/chewxy/math32"
 	"github.com/zhenghaoz/gorse/base/floats"
 	"github.com/zhenghaoz/gorse/base/log"
 	"go.uber.org/zap"
 	"modernc.org/sortutil"
+	"reflect"
+	"sort"
 )
 
 type Vector interface {
@@ -184,7 +182,7 @@ func (v *DictionaryCentroidVector) Distance(vector Vector) float32 {
 }
 
 type VectorIndex interface {
-	Build(ctx context.Context)
+	Build()
 	Search(q Vector, n int, prune0 bool) ([]int32, []float32)
 	MultiSearch(q Vector, terms []string, n int, prune0 bool) (map[string][]int32, map[string][]float32)
 }

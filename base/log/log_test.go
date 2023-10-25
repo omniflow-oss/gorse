@@ -15,19 +15,18 @@
 package log
 
 import (
+	"testing"
+
 	"github.com/spf13/pflag"
 	"github.com/stretchr/testify/assert"
-	"os"
-	"testing"
 )
 
 func TestSetDevelopmentLogger(t *testing.T) {
-	temp, err := os.MkdirTemp("", "gorse")
-	assert.NoError(t, err)
+	temp := t.TempDir()
 	flagSet := pflag.NewFlagSet("test", pflag.ContinueOnError)
 	AddFlags(flagSet)
 	// set existed path
-	err = flagSet.Set("log-path", temp+"/gorse.log")
+	err := flagSet.Set("log-path", temp+"/gorse.log")
 	assert.NoError(t, err)
 	SetLogger(flagSet, true)
 	Logger().Debug("test")
@@ -41,12 +40,11 @@ func TestSetDevelopmentLogger(t *testing.T) {
 }
 
 func TestSetProductionLogger(t *testing.T) {
-	temp, err := os.MkdirTemp("", "gorse")
-	assert.NoError(t, err)
+	temp := t.TempDir()
 	flagSet := pflag.NewFlagSet("test", pflag.ContinueOnError)
 	AddFlags(flagSet)
 	// set existed path
-	err = flagSet.Set("log-path", temp+"/gorse.log")
+	err := flagSet.Set("log-path", temp+"/gorse.log")
 	assert.NoError(t, err)
 	SetLogger(flagSet, false)
 	Logger().Info("test")

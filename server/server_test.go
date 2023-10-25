@@ -17,37 +17,40 @@ package server
 import (
 	"context"
 	"encoding/json"
-	"fmt"
-	"net"
-	"testing"
-
+	"github.com/alicebob/miniredis/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/zhenghaoz/gorse/config"
 	"github.com/zhenghaoz/gorse/protocol"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"net"
+	"testing"
 )
 
 type mockMaster struct {
 	protocol.UnimplementedMasterServer
-	addr          chan string
-	grpcServer    *grpc.Server
-	meta          *protocol.Meta
-	cacheTempFile string
-	dataTempFile  string
+	addr       chan string
+	grpcServer *grpc.Server
+	meta       *protocol.Meta
+	cacheStore *miniredis.Miniredis
+	dataStore  *miniredis.Miniredis
 }
 
 func newMockMaster(t *testing.T) *mockMaster {
+	cacheStore, err := miniredis.Run()
+	assert.NoError(t, err)
+	dataStore, err := miniredis.Run()
+	assert.NoError(t, err)
 	cfg := config.GetDefaultConfig()
-	cfg.Database.DataStore = fmt.Sprintf("sqlite://%s/data.db", t.TempDir())
-	cfg.Database.CacheStore = fmt.Sprintf("sqlite://%s/cache.db", t.TempDir())
+	cfg.Database.DataStore = "redis://" + dataStore.Addr()
+	cfg.Database.CacheStore = "redis://" + cacheStore.Addr()
 	bytes, err := json.Marshal(cfg)
 	assert.NoError(t, err)
 	return &mockMaster{
-		addr:          make(chan string),
-		meta:          &protocol.Meta{Config: string(bytes)},
-		dataTempFile:  cfg.Database.DataStore,
-		cacheTempFile: cfg.Database.CacheStore,
+		addr:       make(chan string),
+		meta:       &protocol.Meta{Config: string(bytes)},
+		cacheStore: cacheStore,
+		dataStore:  dataStore,
 	}
 }
 
@@ -76,6 +79,8 @@ func (m *mockMaster) Start(t *testing.T) {
 
 func (m *mockMaster) Stop() {
 	m.grpcServer.Stop()
+	m.dataStore.Close()
+	m.cacheStore.Close()
 }
 
 func TestServer_Sync(t *testing.T) {
@@ -92,9 +97,7 @@ func TestServer_Sync(t *testing.T) {
 		},
 	}
 	serv.Sync()
-	assert.Equal(t, master.dataTempFile, serv.dataPath)
-	assert.Equal(t, master.cacheTempFile, serv.cachePath)
-	assert.NoError(t, serv.DataClient.Close())
-	assert.NoError(t, serv.CacheClient.Close())
+	assert.Equal(t, "redis://"+master.dataStore.Addr(), serv.dataPath)
+	assert.Equal(t, "redis://"+master.cacheStore.Addr(), serv.cachePath)
 	master.Stop()
 }

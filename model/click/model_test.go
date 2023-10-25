@@ -15,23 +15,23 @@ package click
 
 import (
 	"bytes"
-	"context"
-	"testing"
-
 	"github.com/stretchr/testify/assert"
 	"github.com/zhenghaoz/gorse/base/task"
 	"github.com/zhenghaoz/gorse/model"
+	"testing"
 )
 
 const (
-	regressionDelta     = 0.01
+	regressionDelta     = 0.001
 	classificationDelta = 0.01
 )
 
 func newFitConfigWithTestTracker(numEpoch int) *FitConfig {
+	t := task.NewTask("test", numEpoch)
 	cfg := NewFitConfig().
 		SetVerbose(1).
-		SetJobsAllocator(task.NewConstantJobsAllocator(1))
+		SetJobsAllocator(task.NewConstantJobsAllocator(1)).
+		SetTask(t)
 	return cfg
 }
 
@@ -40,23 +40,19 @@ func TestFM_Classification_Frappe(t *testing.T) {
 	// libfm.exe -train train.libfm -test test.libfm -task c \
 	//   -method sgd -init_stdev 0.01 -dim 1,1,8 -iter 20 \
 	//   -learn_rate 0.01 -regular 0,0,0.0001
-	for _, optimizer := range []string{model.Adam, model.SGD} {
-		t.Run(optimizer, func(t *testing.T) {
-			train, test, err := LoadDataFromBuiltIn("frappe")
-			assert.NoError(t, err)
-			m := NewFM(FMClassification, model.Params{
-				model.InitStdDev: 0.01,
-				model.NFactors:   8,
-				model.NEpochs:    20,
-				model.Lr:         0.01,
-				model.Reg:        0.0001,
-				model.Optimizer:  optimizer,
-			})
-			fitConfig := newFitConfigWithTestTracker(20)
-			score := m.Fit(context.Background(), train, test, fitConfig)
-			assert.InDelta(t, 0.91684, score.Accuracy, classificationDelta)
-		})
-	}
+	train, test, err := LoadDataFromBuiltIn("frappe")
+	assert.NoError(t, err)
+	m := NewFM(FMClassification, model.Params{
+		model.InitStdDev: 0.01,
+		model.NFactors:   8,
+		model.NEpochs:    20,
+		model.Lr:         0.01,
+		model.Reg:        0.0001,
+	})
+	fitConfig := newFitConfigWithTestTracker(20)
+	score := m.Fit(train, test, fitConfig)
+	assert.InDelta(t, 0.91684, score.Accuracy, classificationDelta)
+	assert.Equal(t, m.Complexity(), fitConfig.Task.Done)
 }
 
 //func TestFM_Classification_MovieLens(t *testing.T) {
@@ -92,20 +88,13 @@ func TestFM_Regression_Criteo(t *testing.T) {
 		model.Reg:        0.0001,
 	})
 	fitConfig := newFitConfigWithTestTracker(20)
-	score := m.Fit(context.Background(), train, test, fitConfig)
+	score := m.Fit(train, test, fitConfig)
 	assert.InDelta(t, 0.839194, score.RMSE, regressionDelta)
+	assert.Equal(t, m.Complexity(), fitConfig.Task.Done)
 
 	// test prediction
-	assert.Equal(t, m.InternalPredict([]int32{1, 2, 3, 4, 5, 6}, []float32{1, 1, 0.3, 0.4, 0.5, 0.6}),
-		m.Predict("1", "2",
-			[]Feature{
-				{Name: "3", Value: 0.3},
-				{Name: "4", Value: 0.4},
-			},
-			[]Feature{
-				{Name: "5", Value: 0.5},
-				{Name: "6", Value: 0.6},
-			}))
+	assert.Equal(t, m.InternalPredict([]int32{1, 2, 3, 4, 5, 6}, []float32{1, 1, 0.5, 0.5, 0.5, 0.5}),
+		m.Predict("1", "2", []string{"3", "4"}, []string{"5", "6"}))
 
 	// test increment test
 	buf := bytes.NewBuffer(nil)
@@ -116,11 +105,11 @@ func TestFM_Regression_Criteo(t *testing.T) {
 	m = tmp.(*FM)
 	m.nEpochs = 1
 	fitConfig = newFitConfigWithTestTracker(1)
-	scoreInc := m.Fit(context.Background(), train, test, fitConfig)
+	scoreInc := m.Fit(train, test, fitConfig)
 	assert.InDelta(t, 0.839194, scoreInc.RMSE, regressionDelta)
+	assert.Equal(t, m.Complexity(), fitConfig.Task.Done)
 
 	// test clear
-	assert.False(t, m.Invalid())
 	m.Clear()
 	assert.True(t, m.Invalid())
 }

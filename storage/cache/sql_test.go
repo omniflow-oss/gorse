@@ -17,19 +17,20 @@ package cache
 import (
 	"database/sql"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
-	"github.com/zhenghaoz/gorse/base/log"
 	"github.com/zhenghaoz/gorse/storage"
 )
 
 var (
 	mySqlDSN    string
 	postgresDSN string
+	oracleDSN   string
 )
 
 func init() {
@@ -42,6 +43,7 @@ func init() {
 	}
 	mySqlDSN = env("MYSQL_URI", "mysql://root:password@tcp(127.0.0.1:3306)/")
 	postgresDSN = env("POSTGRES_URI", "postgres://gorse:gorse_pass@127.0.0.1/")
+	oracleDSN = env("ORACLE_URI", "oracle://system:password@127.0.0.1:1521/XE")
 }
 
 type PostgresTestSuite struct {
@@ -109,6 +111,45 @@ func TestMySQL(t *testing.T) {
 	suite.Run(t, new(MySQLTestSuite))
 }
 
+type OracleTestSuite struct {
+	baseTestSuite
+}
+
+func (suite *OracleTestSuite) SetupSuite() {
+	var err error
+	// create database
+	databaseComm, err := sql.Open("oracle", oracleDSN)
+	suite.NoError(err)
+	const dbName = "GORSE_CACHE_TEST"
+	rows, err := databaseComm.Query("select * from dba_users where username=:1", dbName)
+	suite.NoError(err)
+	if rows.Next() {
+		// drop user if exists
+		_, err = databaseComm.Exec(fmt.Sprintf("DROP USER %s CASCADE", dbName))
+		suite.NoError(err)
+	}
+	err = rows.Close()
+	suite.NoError(err)
+	_, err = databaseComm.Exec(fmt.Sprintf("CREATE USER %s IDENTIFIED BY %s", dbName, dbName))
+	suite.NoError(err)
+	_, err = databaseComm.Exec(fmt.Sprintf("GRANT ALL PRIVILEGES TO %s", dbName))
+	suite.NoError(err)
+	err = databaseComm.Close()
+	suite.NoError(err)
+	// connect database
+	parsed, err := url.Parse(oracleDSN)
+	suite.NoError(err)
+	suite.Database, err = Open(fmt.Sprintf("oracle://%s:%s@%s/%s", dbName, dbName, parsed.Host, parsed.Path), "gorse_")
+	suite.NoError(err)
+	// create schema
+	err = suite.Database.Init()
+	suite.NoError(err)
+}
+
+func TestOracle(t *testing.T) {
+	suite.Run(t, new(OracleTestSuite))
+}
+
 type SQLiteTestSuite struct {
 	baseTestSuite
 }
@@ -116,16 +157,11 @@ type SQLiteTestSuite struct {
 func (suite *SQLiteTestSuite) SetupSuite() {
 	var err error
 	// create database
-	path := fmt.Sprintf("sqlite://%s/sqlite.db", suite.T().TempDir())
-	suite.Database, err = Open(path, "gorse_")
+	suite.Database, err = Open("sqlite://:memory:", "gorse_")
 	suite.NoError(err)
 	// create schema
 	err = suite.Database.Init()
 	suite.NoError(err)
-}
-
-func (suite *SQLiteTestSuite) TearDownSuite() {
-	suite.NoError(suite.Database.Close())
 }
 
 func TestSQLite(t *testing.T) {
@@ -140,64 +176,4 @@ func assertQuery(t *testing.T, connection *sql.DB, sql string, expected string) 
 	err = rows.Scan(&result)
 	assert.NoError(t, err)
 	assert.Equal(t, expected, result)
-}
-
-func BenchmarkPostgres(b *testing.B) {
-	log.CloseLogger()
-	// create database
-	databaseComm, err := sql.Open("postgres", postgresDSN+"?sslmode=disable")
-	assert.NoError(b, err)
-	const dbName = "gorse_cache_benchmark"
-	_, err = databaseComm.Exec("DROP DATABASE IF EXISTS " + dbName)
-	assert.NoError(b, err)
-	_, err = databaseComm.Exec("CREATE DATABASE " + dbName)
-	assert.NoError(b, err)
-	err = databaseComm.Close()
-	assert.NoError(b, err)
-	// connect database
-	database, err := Open(postgresDSN+strings.ToLower(dbName)+"?sslmode=disable", "gorse_")
-	assert.NoError(b, err)
-	// create schema
-	err = database.Init()
-	assert.NoError(b, err)
-	// benchmark
-	benchmark(b, database)
-	// close database
-	err = database.Close()
-	assert.NoError(b, err)
-}
-
-func BenchmarkMySQL(b *testing.B) {
-	log.CloseLogger()
-	// create database
-	databaseComm, err := sql.Open("mysql", mySqlDSN[len(storage.MySQLPrefix):])
-	assert.NoError(b, err)
-	const dbName = "gorse_cache_benchmark"
-	_, err = databaseComm.Exec("DROP DATABASE IF EXISTS " + dbName)
-	assert.NoError(b, err)
-	_, err = databaseComm.Exec("CREATE DATABASE " + dbName)
-	assert.NoError(b, err)
-	err = databaseComm.Close()
-	assert.NoError(b, err)
-	// connect database
-	database, err := Open(mySqlDSN+dbName, "gorse_")
-	assert.NoError(b, err)
-	// create schema
-	err = database.Init()
-	assert.NoError(b, err)
-	// benchmark
-	benchmark(b, database)
-}
-
-func BenchmarkSQLite(b *testing.B) {
-	log.CloseLogger()
-	// create database
-	path := fmt.Sprintf("sqlite://%s/sqlite.db", b.TempDir())
-	database, err := Open(path, "gorse_")
-	assert.NoError(b, err)
-	// create schema
-	err = database.Init()
-	assert.NoError(b, err)
-	// benchmark
-	benchmark(b, database)
 }

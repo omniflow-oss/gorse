@@ -17,23 +17,21 @@ package master
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/chewxy/math32"
-	mapset "github.com/deckarep/golang-set/v2"
 	"github.com/juju/errors"
 	"github.com/samber/lo"
+	"github.com/scylladb/go-set/i32set"
 	"github.com/zhenghaoz/gorse/base"
 	"github.com/zhenghaoz/gorse/base/encoding"
 	"github.com/zhenghaoz/gorse/base/heap"
 	"github.com/zhenghaoz/gorse/base/log"
 	"github.com/zhenghaoz/gorse/base/parallel"
-	"github.com/zhenghaoz/gorse/base/progress"
 	"github.com/zhenghaoz/gorse/base/search"
-	"github.com/zhenghaoz/gorse/base/sizeof"
 	"github.com/zhenghaoz/gorse/base/task"
 	"github.com/zhenghaoz/gorse/config"
 	"github.com/zhenghaoz/gorse/model/click"
@@ -42,7 +40,6 @@ import (
 	"github.com/zhenghaoz/gorse/storage/data"
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
-	"google.golang.org/protobuf/proto"
 	"modernc.org/sortutil"
 )
 
@@ -65,14 +62,12 @@ const (
 type Task interface {
 	name() string
 	priority() int
-	run(ctx context.Context, j *task.JobsAllocator) error
+	run(j *task.JobsAllocator) error
 }
 
 // runLoadDatasetTask loads dataset.
 func (m *Master) runLoadDatasetTask() error {
-	ctx, span := m.tracer.Start(context.Background(), "Load Dataset", 1)
-	defer span.End()
-
+	ctx := context.Background()
 	initialStartTime := time.Now()
 	log.Logger().Info("load dataset",
 		zap.Strings("positive_feedback_types", m.Config.Recommend.DataSource.PositiveFeedbackTypes),
@@ -80,7 +75,7 @@ func (m *Master) runLoadDatasetTask() error {
 		zap.Uint("item_ttl", m.Config.Recommend.DataSource.ItemTTL),
 		zap.Uint("feedback_ttl", m.Config.Recommend.DataSource.PositiveFeedbackTTL))
 	evaluator := NewOnlineEvaluator()
-	rankingDataset, clickDataset, latestItems, popularItems, err := m.LoadDataFromDatabase(ctx, m.DataClient,
+	rankingDataset, clickDataset, latestItems, popularItems, err := m.LoadDataFromDatabase(m.DataClient,
 		m.Config.Recommend.DataSource.PositiveFeedbackTypes,
 		m.Config.Recommend.DataSource.ReadFeedbackTypes,
 		m.Config.Recommend.DataSource.ItemTTL,
@@ -91,22 +86,27 @@ func (m *Master) runLoadDatasetTask() error {
 	}
 
 	// save popular items to cache
-	if err = m.CacheClient.AddDocuments(ctx, cache.PopularItems, "", popularItems.ToSlice()); err != nil {
-		log.Logger().Error("failed to cache popular items", zap.Error(err))
-	}
-	if err = m.CacheClient.DeleteDocuments(ctx, []string{cache.PopularItems}, cache.DocumentCondition{Before: &popularItems.Timestamp}); err != nil {
-		log.Logger().Error("failed to reclaim outdated items", zap.Error(err))
+	for category, items := range popularItems {
+		if err = m.CacheClient.SetSorted(ctx, cache.Key(cache.PopularItems, category), items); err != nil {
+			log.Logger().Error("failed to cache popular items", zap.Error(err))
+		}
 	}
 	if err = m.CacheClient.Set(ctx, cache.Time(cache.Key(cache.GlobalMeta, cache.LastUpdatePopularItemsTime), time.Now())); err != nil {
 		log.Logger().Error("failed to write latest update popular items time", zap.Error(err))
 	}
 
 	// save the latest items to cache
-	if err = m.CacheClient.AddDocuments(ctx, cache.LatestItems, "", latestItems.ToSlice()); err != nil {
-		log.Logger().Error("failed to cache latest items", zap.Error(err))
-	}
-	if err = m.CacheClient.DeleteDocuments(ctx, []string{cache.LatestItems}, cache.DocumentCondition{Before: &latestItems.Timestamp}); err != nil {
-		log.Logger().Error("failed to reclaim outdated items", zap.Error(err))
+	for category, items := range latestItems {
+		if err = m.CacheClient.AddSorted(ctx, cache.Sorted(cache.Key(cache.LatestItems, category), items)); err != nil {
+			log.Logger().Error("failed to cache latest items", zap.Error(err))
+		}
+		// reclaim outdated items
+		if len(items) > 0 {
+			threshold := items[len(items)-1].Score - 1
+			if err = m.CacheClient.RemSortedByScore(ctx, cache.Key(cache.LatestItems, category), math.Inf(-1), threshold); err != nil {
+				log.Logger().Error("failed to reclaim outdated items", zap.Error(err))
+			}
+		}
 	}
 	if err = m.CacheClient.Set(ctx, cache.Time(cache.Key(cache.GlobalMeta, cache.LastUpdateLatestItemsTime), time.Now())); err != nil {
 		log.Logger().Error("failed to write latest update latest items time", zap.Error(err))
@@ -144,8 +144,8 @@ func (m *Master) runLoadDatasetTask() error {
 	}
 
 	// evaluate positive feedback rate
-	points := evaluator.Evaluate()
-	if err = m.CacheClient.AddTimeSeriesPoints(ctx, points); err != nil {
+	measurement := evaluator.Evaluate()
+	if err = m.RestServer.InsertMeasurement(ctx, measurement...); err != nil {
 		log.Logger().Error("failed to insert measurement", zap.Error(err))
 	}
 
@@ -171,7 +171,7 @@ func (m *Master) runLoadDatasetTask() error {
 	InactiveItemsTotal.Set(float64(inactiveItems))
 
 	// write categories to cache
-	if err = m.CacheClient.SetSet(ctx, cache.ItemCategories, rankingDataset.CategorySet.ToSlice()...); err != nil {
+	if err = m.CacheClient.SetSet(ctx, cache.ItemCategories, rankingDataset.CategorySet.List()...); err != nil {
 		log.Logger().Error("failed to write categories to cache", zap.Error(err))
 	}
 
@@ -192,11 +192,27 @@ func (m *Master) runLoadDatasetTask() error {
 	clickDataset = nil
 	m.clickDataMutex.Unlock()
 	LoadDatasetStepSecondsVec.WithLabelValues("split_click_dataset").Set(time.Since(startTime).Seconds())
-	MemoryInUseBytesVec.WithLabelValues("ranking_train_set").Set(float64(sizeof.DeepSize(m.clickTrainSet)))
-	MemoryInUseBytesVec.WithLabelValues("ranking_test_set").Set(float64(sizeof.DeepSize(m.clickTestSet)))
+	MemoryInUseBytesVec.WithLabelValues("ranking_train_set").Set(float64(m.clickTrainSet.Bytes()))
+	MemoryInUseBytesVec.WithLabelValues("ranking_test_set").Set(float64(m.clickTestSet.Bytes()))
 
 	LoadDatasetTotalSeconds.Set(time.Since(initialStartTime).Seconds())
 	return nil
+}
+
+func (m *Master) estimateFindItemNeighborsComplexity(dataset *ranking.DataSet) int {
+	complexity := dataset.ItemCount() * dataset.ItemCount()
+	if m.Config.Recommend.ItemNeighbors.NeighborType == config.NeighborTypeRelated ||
+		m.Config.Recommend.ItemNeighbors.NeighborType == config.NeighborTypeAuto {
+		complexity += len(dataset.UserFeedback) + len(dataset.ItemFeedback)
+	}
+	if m.Config.Recommend.ItemNeighbors.NeighborType == config.NeighborTypeSimilar ||
+		m.Config.Recommend.ItemNeighbors.NeighborType == config.NeighborTypeAuto {
+		complexity += len(dataset.ItemLabels) + int(dataset.NumItemLabels)
+	}
+	if m.Config.Recommend.ItemNeighbors.EnableIndex {
+		complexity += search.EstimateIVFBuilderComplexity(dataset.ItemCount(), m.Config.Recommend.ItemNeighbors.IndexFitEpoch)
+	}
+	return complexity
 }
 
 // FindItemNeighborsTask updates neighbors of items.
@@ -218,17 +234,16 @@ func (t *FindItemNeighborsTask) priority() int {
 	return -t.rankingTrainSet.ItemCount() * t.rankingTrainSet.ItemCount()
 }
 
-func (t *FindItemNeighborsTask) run(ctx context.Context, j *task.JobsAllocator) error {
+func (t *FindItemNeighborsTask) run(j *task.JobsAllocator) error {
 	t.rankingDataMutex.RLock()
 	defer t.rankingDataMutex.RUnlock()
 	dataset := t.rankingTrainSet
 	numItems := dataset.ItemCount()
 	numFeedback := dataset.Count()
-
-	newCtx, span := t.tracer.Start(ctx, "Find Item Neighbors", dataset.ItemCount())
-	defer span.End()
+	ctx := context.Background()
 
 	if numItems == 0 {
+		t.taskMonitor.Fail(TaskFindItemNeighbors, "No item found.")
 		return nil
 	} else if numItems == t.lastNumItems && numFeedback == t.lastNumFeedback {
 		log.Logger().Info("No item neighbors need to be updated.")
@@ -236,6 +251,7 @@ func (t *FindItemNeighborsTask) run(ctx context.Context, j *task.JobsAllocator) 
 	}
 
 	startTaskTime := time.Now()
+	t.taskMonitor.Start(TaskFindItemNeighbors, t.estimateFindItemNeighborsComplexity(dataset))
 	log.Logger().Info("start searching neighbors of items",
 		zap.Int("n_cache", t.Config.Recommend.CacheSize))
 	// create progress tracker
@@ -254,11 +270,11 @@ func (t *FindItemNeighborsTask) run(ctx context.Context, j *task.JobsAllocator) 
 				throughput := completedCount - previousCount
 				previousCount = completedCount
 				if throughput > 0 {
+					t.taskMonitor.Add(TaskFindItemNeighbors, throughput*dataset.ItemCount())
 					log.Logger().Debug("searching neighbors of items",
 						zap.Int("n_complete_items", completedCount),
 						zap.Int("n_items", dataset.ItemCount()),
 						zap.Int("throughput", throughput/10))
-					span.Add(throughput)
 				}
 			}
 		}
@@ -270,6 +286,7 @@ func (t *FindItemNeighborsTask) run(ctx context.Context, j *task.JobsAllocator) 
 		for _, feedbacks := range dataset.ItemFeedback {
 			sort.Sort(sortutil.Int32Slice(feedbacks))
 		}
+		t.taskMonitor.Add(TaskFindItemNeighbors, len(dataset.ItemFeedback))
 		// inverse document frequency of users
 		for i := range dataset.UserFeedback {
 			if dataset.ItemCount() == len(dataset.UserFeedback[i]) {
@@ -278,19 +295,19 @@ func (t *FindItemNeighborsTask) run(ctx context.Context, j *task.JobsAllocator) 
 				userIDF[i] = math32.Log(float32(dataset.ItemCount()) / float32(len(dataset.UserFeedback[i])))
 			}
 		}
+		t.taskMonitor.Add(TaskFindItemNeighbors, len(dataset.UserFeedback))
 	}
 	labeledItems := make([][]int32, dataset.NumItemLabels)
 	labelIDF := make([]float32, dataset.NumItemLabels)
 	if t.Config.Recommend.ItemNeighbors.NeighborType == config.NeighborTypeSimilar ||
 		t.Config.Recommend.ItemNeighbors.NeighborType == config.NeighborTypeAuto {
-		for i, itemLabels := range dataset.ItemFeatures {
-			sort.Slice(itemLabels, func(i, j int) bool {
-				return itemLabels[i].A < itemLabels[j].A
-			})
+		for i, itemLabels := range dataset.ItemLabels {
+			sort.Sort(sortutil.Int32Slice(itemLabels))
 			for _, label := range itemLabels {
-				labeledItems[label.A] = append(labeledItems[label.A], int32(i))
+				labeledItems[label] = append(labeledItems[label], int32(i))
 			}
 		}
+		t.taskMonitor.Add(TaskFindItemNeighbors, len(dataset.ItemLabels))
 		// inverse document frequency of labels
 		for i := range labeledItems {
 			labeledItems[i] = lo.Uniq(labeledItems[i])
@@ -300,6 +317,7 @@ func (t *FindItemNeighborsTask) run(ctx context.Context, j *task.JobsAllocator) 
 				labelIDF[i] = math32.Log(float32(dataset.ItemCount()) / float32(len(labeledItems[i])))
 			}
 		}
+		t.taskMonitor.Add(TaskFindItemNeighbors, len(labeledItems))
 	}
 
 	start := time.Now()
@@ -314,7 +332,7 @@ func (t *FindItemNeighborsTask) run(ctx context.Context, j *task.JobsAllocator) 
 	close(completed)
 	if err != nil {
 		log.Logger().Error("failed to searching neighbors of items", zap.Error(err))
-		progress.Fail(newCtx, err)
+		t.taskMonitor.Fail(TaskFindItemNeighbors, err.Error())
 		FindItemNeighborsTotalSeconds.Set(0)
 	} else {
 		if err := t.CacheClient.Set(ctx, cache.Time(cache.Key(cache.GlobalMeta, cache.LastUpdateItemNeighborsTime), time.Now())); err != nil {
@@ -322,6 +340,7 @@ func (t *FindItemNeighborsTask) run(ctx context.Context, j *task.JobsAllocator) 
 		}
 		log.Logger().Info("complete searching neighbors of items",
 			zap.String("search_time", searchTime.String()))
+		t.taskMonitor.Finish(TaskFindItemNeighbors)
 		FindItemNeighborsTotalSeconds.Set(time.Since(startTaskTime).Seconds())
 	}
 
@@ -341,18 +360,12 @@ func (m *Master) findItemNeighborsBruteForce(dataset *ranking.DataSet, labeledIt
 	var vector VectorsInterface
 	switch m.Config.Recommend.ItemNeighbors.NeighborType {
 	case config.NeighborTypeSimilar:
-		vector = NewVectors(lo.Map(dataset.ItemFeatures, func(features []lo.Tuple2[int32, float32], _ int) []int32 {
-			indices, _ := lo.Unzip2(features)
-			return indices
-		}), labeledItems, labelIDF)
+		vector = NewVectors(dataset.ItemLabels, labeledItems, labelIDF)
 	case config.NeighborTypeRelated:
 		vector = NewVectors(dataset.ItemFeedback, dataset.UserFeedback, userIDF)
 	case config.NeighborTypeAuto:
 		vector = NewDualVectors(
-			NewVectors(lo.Map(dataset.ItemFeatures, func(features []lo.Tuple2[int32, float32], _ int) []int32 {
-				indices, _ := lo.Unzip2(features)
-				return indices
-			}), labeledItems, labelIDF),
+			NewVectors(dataset.ItemLabels, labeledItems, labelIDF),
 			NewVectors(dataset.ItemFeedback, dataset.UserFeedback, userIDF))
 	default:
 		return errors.NotImplementedf("item neighbor type `%v`", m.Config.Recommend.ItemNeighbors.NeighborType)
@@ -362,17 +375,16 @@ func (m *Master) findItemNeighborsBruteForce(dataset *ranking.DataSet, labeledIt
 		defer func() {
 			completed <- struct{}{}
 		}()
-		startSearchTime := time.Now()
 		itemId := dataset.ItemIndex.ToName(int32(itemIndex))
-		if !m.checkItemNeighborCacheTimeout(itemId, dataset.CategorySet.ToSlice()) {
+		if !m.checkItemNeighborCacheTimeout(itemId, dataset.CategorySet.List()) {
 			return nil
 		}
 		updateItemCount.Add(1)
 		startTime := time.Now()
-		nearItemsFilters := make(map[string]*heap.TopKFilter[int32, float64])
-		nearItemsFilters[""] = heap.NewTopKFilter[int32, float64](m.Config.Recommend.CacheSize)
-		for _, category := range dataset.CategorySet.ToSlice() {
-			nearItemsFilters[category] = heap.NewTopKFilter[int32, float64](m.Config.Recommend.CacheSize)
+		nearItemsFilters := make(map[string]*heap.TopKFilter[int32, float32])
+		nearItemsFilters[""] = heap.NewTopKFilter[int32, float32](m.Config.Recommend.CacheSize)
+		for _, category := range dataset.CategorySet.List() {
+			nearItemsFilters[category] = heap.NewTopKFilter[int32, float32](m.Config.Recommend.CacheSize)
 		}
 
 		adjacencyItems := vector.Neighbors(itemIndex)
@@ -380,31 +392,24 @@ func (m *Master) findItemNeighborsBruteForce(dataset *ranking.DataSet, labeledIt
 			if j != int32(itemIndex) && !dataset.HiddenItems[j] {
 				score := vector.Distance(itemIndex, int(j))
 				if score > 0 {
-					nearItemsFilters[""].Push(j, float64(score))
+					nearItemsFilters[""].Push(j, score)
 					for _, category := range dataset.ItemCategories[j] {
-						nearItemsFilters[category].Push(j, float64(score))
+						nearItemsFilters[category].Push(j, score)
 					}
 				}
 			}
 		}
 
-		aggregator := cache.NewDocumentAggregator(startSearchTime)
 		for category, nearItemsFilter := range nearItemsFilters {
 			elem, scores := nearItemsFilter.PopAll()
 			recommends := make([]string, len(elem))
 			for i := range recommends {
 				recommends[i] = dataset.ItemIndex.ToName(elem[i])
 			}
-			aggregator.Add(category, recommends, scores)
-		}
-		if err := m.CacheClient.AddDocuments(ctx, cache.ItemNeighbors, itemId, aggregator.ToSlice()); err != nil {
-			return errors.Trace(err)
-		}
-		if err := m.CacheClient.DeleteDocuments(ctx, []string{cache.ItemNeighbors}, cache.DocumentCondition{
-			Subset: proto.String(itemId),
-			Before: &aggregator.Timestamp,
-		}); err != nil {
-			return errors.Trace(err)
+			if err := m.CacheClient.SetSorted(ctx, cache.Key(cache.ItemNeighbors, itemId, category),
+				cache.CreateScoredItems(recommends, scores)); err != nil {
+				return errors.Trace(err)
+			}
 		}
 		if err := m.CacheClient.Set(
 			ctx,
@@ -439,18 +444,16 @@ func (m *Master) findItemNeighborsIVF(dataset *ranking.DataSet, labelIDF, userID
 	var vectors []search.Vector
 	switch m.Config.Recommend.ItemNeighbors.NeighborType {
 	case config.NeighborTypeSimilar:
-		vectors = lo.Map(dataset.ItemFeatures, func(_ []lo.Tuple2[int32, float32], i int) search.Vector {
-			indices, _ := lo.Unzip2(dataset.ItemFeatures[i])
-			return search.NewDictionaryVector(indices, labelIDF, dataset.ItemCategories[i], dataset.HiddenItems[i])
+		vectors = lo.Map(dataset.ItemLabels, func(_ []int32, i int) search.Vector {
+			return search.NewDictionaryVector(dataset.ItemLabels[i], labelIDF, dataset.ItemCategories[i], dataset.HiddenItems[i])
 		})
 	case config.NeighborTypeRelated:
-		vectors = lo.Map(dataset.ItemFeatures, func(_ []lo.Tuple2[int32, float32], i int) search.Vector {
+		vectors = lo.Map(dataset.ItemLabels, func(_ []int32, i int) search.Vector {
 			return search.NewDictionaryVector(dataset.ItemFeedback[i], userIDF, dataset.ItemCategories[i], dataset.HiddenItems[i])
 		})
 	case config.NeighborTypeAuto:
-		vectors = lo.Map(dataset.ItemFeatures, func(_ []lo.Tuple2[int32, float32], i int) search.Vector {
-			indices, _ := lo.Unzip2(dataset.ItemFeatures[i])
-			return NewDualDictionaryVector(indices, labelIDF, dataset.ItemFeedback[i], userIDF, dataset.ItemCategories[i], dataset.HiddenItems[i])
+		vectors = lo.Map(dataset.ItemLabels, func(_ []int32, i int) search.Vector {
+			return NewDualDictionaryVector(dataset.ItemLabels[i], labelIDF, dataset.ItemFeedback[i], userIDF, dataset.ItemCategories[i], dataset.HiddenItems[i])
 		})
 	default:
 		return errors.NotImplementedf("item neighbor type `%v`", m.Config.Recommend.ItemNeighbors.NeighborType)
@@ -461,7 +464,8 @@ func (m *Master) findItemNeighborsIVF(dataset *ranking.DataSet, labelIDF, userID
 	var recall float32
 	index, recall = builder.Build(m.Config.Recommend.ItemNeighbors.IndexRecall,
 		m.Config.Recommend.ItemNeighbors.IndexFitEpoch,
-		true)
+		true,
+		m.taskMonitor.GetTask(TaskFindItemNeighbors))
 	ItemNeighborIndexRecall.Set(float64(recall))
 	if err := m.CacheClient.Set(ctx, cache.String(cache.Key(cache.GlobalMeta, cache.ItemNeighborIndexRecall), encoding.FormatFloat32(recall))); err != nil {
 		return errors.Trace(err)
@@ -472,9 +476,8 @@ func (m *Master) findItemNeighborsIVF(dataset *ranking.DataSet, labelIDF, userID
 		defer func() {
 			completed <- struct{}{}
 		}()
-		startSearchTime := time.Now()
 		itemId := dataset.ItemIndex.ToName(int32(itemIndex))
-		if !m.checkItemNeighborCacheTimeout(itemId, dataset.CategorySet.ToSlice()) {
+		if !m.checkItemNeighborCacheTimeout(itemId, dataset.CategorySet.List()) {
 			return nil
 		}
 		updateItemCount.Add(1)
@@ -483,33 +486,25 @@ func (m *Master) findItemNeighborsIVF(dataset *ranking.DataSet, labelIDF, userID
 		var scores map[string][]float32
 		if m.Config.Recommend.ItemNeighbors.NeighborType == config.NeighborTypeSimilar ||
 			m.Config.Recommend.ItemNeighbors.NeighborType == config.NeighborTypeAuto {
-			neighbors, scores = index.MultiSearch(vectors[itemIndex], dataset.CategorySet.ToSlice(),
+			neighbors, scores = index.MultiSearch(vectors[itemIndex], dataset.CategorySet.List(),
 				m.Config.Recommend.CacheSize, true)
 		}
 		if m.Config.Recommend.ItemNeighbors.NeighborType == config.NeighborTypeRelated ||
 			m.Config.Recommend.ItemNeighbors.NeighborType == config.NeighborTypeAuto && len(neighbors[""]) == 0 {
-			neighbors, scores = index.MultiSearch(vectors[itemIndex], dataset.CategorySet.ToSlice(),
+			neighbors, scores = index.MultiSearch(vectors[itemIndex], dataset.CategorySet.List(),
 				m.Config.Recommend.CacheSize, true)
 		}
-		aggregator := cache.NewDocumentAggregator(startSearchTime)
 		for category := range neighbors {
 			if categoryNeighbors, exist := neighbors[category]; exist && len(categoryNeighbors) > 0 {
-				resultValues, resultScores := make([]string, len(neighbors[category])), make([]float64, len(neighbors[category]))
+				itemScores := make([]cache.Scored, len(neighbors[category]))
 				for i := range scores[category] {
-					resultValues[i] = dataset.ItemIndex.ToName(neighbors[category][i])
-					resultScores[i] = float64(-scores[category][i])
+					itemScores[i].Id = dataset.ItemIndex.ToName(neighbors[category][i])
+					itemScores[i].Score = float64(-scores[category][i])
 				}
-				aggregator.Add(category, resultValues, resultScores)
+				if err := m.CacheClient.SetSorted(ctx, cache.Key(cache.ItemNeighbors, itemId, category), itemScores); err != nil {
+					return errors.Trace(err)
+				}
 			}
-		}
-		if err := m.CacheClient.AddDocuments(ctx, cache.ItemNeighbors, itemId, aggregator.ToSlice()); err != nil {
-			return errors.Trace(err)
-		}
-		if err := m.CacheClient.DeleteDocuments(ctx, []string{cache.ItemNeighbors}, cache.DocumentCondition{
-			Subset: proto.String(itemId),
-			Before: &aggregator.Timestamp,
-		}); err != nil {
-			return errors.Trace(err)
 		}
 		if err := m.CacheClient.Set(
 			ctx,
@@ -527,6 +522,22 @@ func (m *Master) findItemNeighborsIVF(dataset *ranking.DataSet, labelIDF, userID
 	FindItemNeighborsSecondsVec.WithLabelValues("find_item_neighbors").Set(findNeighborSeconds.Load())
 	FindItemNeighborsSecondsVec.WithLabelValues("build_index").Set(buildIndexSeconds.Load())
 	return nil
+}
+
+func (m *Master) estimateFindUserNeighborsComplexity(dataset *ranking.DataSet) int {
+	complexity := dataset.UserCount() * dataset.UserCount()
+	if m.Config.Recommend.UserNeighbors.NeighborType == config.NeighborTypeRelated ||
+		m.Config.Recommend.UserNeighbors.NeighborType == config.NeighborTypeAuto {
+		complexity += len(dataset.UserFeedback) + len(dataset.ItemFeedback)
+	}
+	if m.Config.Recommend.UserNeighbors.NeighborType == config.NeighborTypeSimilar ||
+		m.Config.Recommend.UserNeighbors.NeighborType == config.NeighborTypeAuto {
+		complexity += len(dataset.UserLabels) + int(dataset.NumUserLabels)
+	}
+	if m.Config.Recommend.UserNeighbors.EnableIndex {
+		complexity += search.EstimateIVFBuilderComplexity(dataset.UserCount(), m.Config.Recommend.UserNeighbors.IndexFitEpoch)
+	}
+	return complexity
 }
 
 // FindUserNeighborsTask updates neighbors of users.
@@ -548,17 +559,16 @@ func (t *FindUserNeighborsTask) priority() int {
 	return -t.rankingTrainSet.UserCount() * t.rankingTrainSet.UserCount()
 }
 
-func (t *FindUserNeighborsTask) run(ctx context.Context, j *task.JobsAllocator) error {
+func (t *FindUserNeighborsTask) run(j *task.JobsAllocator) error {
 	t.rankingDataMutex.RLock()
 	defer t.rankingDataMutex.RUnlock()
 	dataset := t.rankingTrainSet
 	numUsers := dataset.UserCount()
 	numFeedback := dataset.Count()
-
-	newCtx, span := t.tracer.Start(ctx, "Find User Neighbors", dataset.UserCount())
-	defer span.End()
+	ctx := context.Background()
 
 	if numUsers == 0 {
+		t.taskMonitor.Fail(TaskFindItemNeighbors, "No item found.")
 		return nil
 	} else if numUsers == t.lastNumUsers && numFeedback == t.lastNumFeedback {
 		log.Logger().Info("No update of user neighbors needed.")
@@ -566,6 +576,7 @@ func (t *FindUserNeighborsTask) run(ctx context.Context, j *task.JobsAllocator) 
 	}
 
 	startTaskTime := time.Now()
+	t.taskMonitor.Start(TaskFindUserNeighbors, t.estimateFindUserNeighborsComplexity(dataset))
 	log.Logger().Info("start searching neighbors of users",
 		zap.Int("n_cache", t.Config.Recommend.CacheSize))
 	// create progress tracker
@@ -584,11 +595,11 @@ func (t *FindUserNeighborsTask) run(ctx context.Context, j *task.JobsAllocator) 
 				throughput := completedCount - previousCount
 				previousCount = completedCount
 				if throughput > 0 {
+					t.taskMonitor.Add(TaskFindUserNeighbors, throughput*dataset.UserCount())
 					log.Logger().Debug("searching neighbors of users",
 						zap.Int("n_complete_users", completedCount),
 						zap.Int("n_users", dataset.UserCount()),
 						zap.Int("throughput", throughput))
-					span.Add(throughput)
 				}
 			}
 		}
@@ -600,6 +611,7 @@ func (t *FindUserNeighborsTask) run(ctx context.Context, j *task.JobsAllocator) 
 		for _, feedbacks := range dataset.UserFeedback {
 			sort.Sort(sortutil.Int32Slice(feedbacks))
 		}
+		t.taskMonitor.Add(TaskFindUserNeighbors, len(dataset.UserFeedback))
 		// inverse document frequency of items
 		for i := range dataset.ItemFeedback {
 			if dataset.UserCount() == len(dataset.ItemFeedback[i]) {
@@ -608,19 +620,19 @@ func (t *FindUserNeighborsTask) run(ctx context.Context, j *task.JobsAllocator) 
 				itemIDF[i] = math32.Log(float32(dataset.UserCount()) / float32(len(dataset.ItemFeedback[i])))
 			}
 		}
+		t.taskMonitor.Add(TaskFindUserNeighbors, len(dataset.ItemFeedback))
 	}
 	labeledUsers := make([][]int32, dataset.NumUserLabels)
 	labelIDF := make([]float32, dataset.NumUserLabels)
 	if t.Config.Recommend.UserNeighbors.NeighborType == config.NeighborTypeSimilar ||
 		t.Config.Recommend.UserNeighbors.NeighborType == config.NeighborTypeAuto {
-		for i, userLabels := range dataset.UserFeatures {
-			sort.Slice(userLabels, func(i, j int) bool {
-				return userLabels[i].A < userLabels[j].A
-			})
+		for i, userLabels := range dataset.UserLabels {
+			sort.Sort(sortutil.Int32Slice(userLabels))
 			for _, label := range userLabels {
-				labeledUsers[label.A] = append(labeledUsers[label.A], int32(i))
+				labeledUsers[label] = append(labeledUsers[label], int32(i))
 			}
 		}
+		t.taskMonitor.Add(TaskFindUserNeighbors, len(dataset.UserLabels))
 		// inverse document frequency of labels
 		for i := range labeledUsers {
 			labeledUsers[i] = lo.Uniq(labeledUsers[i])
@@ -630,21 +642,22 @@ func (t *FindUserNeighborsTask) run(ctx context.Context, j *task.JobsAllocator) 
 				labelIDF[i] = math32.Log(float32(dataset.UserCount()) / float32(len(labeledUsers[i])))
 			}
 		}
+		t.taskMonitor.Add(TaskFindUserNeighbors, len(labeledUsers))
 	}
 
 	start := time.Now()
 	var err error
 	if t.Config.Recommend.UserNeighbors.EnableIndex {
-		err = t.findUserNeighborsIVF(newCtx, dataset, labelIDF, itemIDF, completed, j)
+		err = t.findUserNeighborsIVF(dataset, labelIDF, itemIDF, completed, j)
 	} else {
-		err = t.findUserNeighborsBruteForce(newCtx, dataset, labeledUsers, labelIDF, itemIDF, completed, j)
+		err = t.findUserNeighborsBruteForce(dataset, labeledUsers, labelIDF, itemIDF, completed, j)
 	}
 	searchTime := time.Since(start)
 
 	close(completed)
 	if err != nil {
 		log.Logger().Error("failed to searching neighbors of users", zap.Error(err))
-		progress.Fail(newCtx, err)
+		t.taskMonitor.Fail(TaskFindUserNeighbors, err.Error())
 		FindUserNeighborsTotalSeconds.Set(0)
 	} else {
 		if err := t.CacheClient.Set(ctx, cache.Time(cache.Key(cache.GlobalMeta, cache.LastUpdateUserNeighborsTime), time.Now())); err != nil {
@@ -652,6 +665,7 @@ func (t *FindUserNeighborsTask) run(ctx context.Context, j *task.JobsAllocator) 
 		}
 		log.Logger().Info("complete searching neighbors of users",
 			zap.String("search_time", searchTime.String()))
+		t.taskMonitor.Finish(TaskFindUserNeighbors)
 		FindUserNeighborsTotalSeconds.Set(time.Since(startTaskTime).Seconds())
 	}
 
@@ -660,27 +674,22 @@ func (t *FindUserNeighborsTask) run(ctx context.Context, j *task.JobsAllocator) 
 	return nil
 }
 
-func (m *Master) findUserNeighborsBruteForce(ctx context.Context, dataset *ranking.DataSet, labeledUsers [][]int32, labelIDF, itemIDF []float32, completed chan struct{}, j *task.JobsAllocator) error {
+func (m *Master) findUserNeighborsBruteForce(dataset *ranking.DataSet, labeledUsers [][]int32, labelIDF, itemIDF []float32, completed chan struct{}, j *task.JobsAllocator) error {
 	var (
 		updateUserCount     atomic.Float64
 		findNeighborSeconds atomic.Float64
 	)
+	ctx := context.Background()
 
 	var vectors VectorsInterface
 	switch m.Config.Recommend.UserNeighbors.NeighborType {
 	case config.NeighborTypeSimilar:
-		vectors = NewVectors(lo.Map(dataset.UserFeatures, func(features []lo.Tuple2[int32, float32], _ int) []int32 {
-			indices, _ := lo.Unzip2(features)
-			return indices
-		}), labeledUsers, labelIDF)
+		vectors = NewVectors(dataset.UserLabels, labeledUsers, labelIDF)
 	case config.NeighborTypeRelated:
 		vectors = NewVectors(dataset.UserFeedback, dataset.ItemFeedback, itemIDF)
 	case config.NeighborTypeAuto:
 		vectors = NewDualVectors(
-			NewVectors(lo.Map(dataset.UserFeatures, func(features []lo.Tuple2[int32, float32], _ int) []int32 {
-				indices, _ := lo.Unzip2(features)
-				return indices
-			}), labeledUsers, labelIDF),
+			NewVectors(dataset.UserLabels, labeledUsers, labelIDF),
 			NewVectors(dataset.UserFeedback, dataset.ItemFeedback, itemIDF))
 	default:
 		return errors.NotImplementedf("user neighbor type `%v`", m.Config.Recommend.UserNeighbors.NeighborType)
@@ -690,21 +699,20 @@ func (m *Master) findUserNeighborsBruteForce(ctx context.Context, dataset *ranki
 		defer func() {
 			completed <- struct{}{}
 		}()
-		startSearchTime := time.Now()
 		userId := dataset.UserIndex.ToName(int32(userIndex))
 		if !m.checkUserNeighborCacheTimeout(userId) {
 			return nil
 		}
 		updateUserCount.Add(1)
 		startTime := time.Now()
-		nearUsers := heap.NewTopKFilter[int32, float64](m.Config.Recommend.CacheSize)
+		nearUsers := heap.NewTopKFilter[int32, float32](m.Config.Recommend.CacheSize)
 
 		adjacencyUsers := vectors.Neighbors(userIndex)
 		for _, j := range adjacencyUsers {
 			if j != int32(userIndex) {
 				score := vectors.Distance(userIndex, int(j))
 				if score > 0 {
-					nearUsers.Push(j, float64(score))
+					nearUsers.Push(j, score)
 				}
 			}
 		}
@@ -714,15 +722,8 @@ func (m *Master) findUserNeighborsBruteForce(ctx context.Context, dataset *ranki
 		for i := range recommends {
 			recommends[i] = dataset.UserIndex.ToName(elem[i])
 		}
-		aggregator := cache.NewDocumentAggregator(startSearchTime)
-		aggregator.Add("", recommends, scores)
-		if err := m.CacheClient.AddDocuments(ctx, cache.UserNeighbors, userId, aggregator.ToSlice()); err != nil {
-			return errors.Trace(err)
-		}
-		if err := m.CacheClient.DeleteDocuments(ctx, []string{cache.UserNeighbors}, cache.DocumentCondition{
-			Subset: proto.String(userId),
-			Before: &aggregator.Timestamp,
-		}); err != nil {
+		if err := m.CacheClient.SetSorted(ctx, cache.Key(cache.UserNeighbors, userId),
+			cache.CreateScoredItems(recommends, scores)); err != nil {
 			return errors.Trace(err)
 		}
 		if err := m.CacheClient.Set(
@@ -744,20 +745,20 @@ func (m *Master) findUserNeighborsBruteForce(ctx context.Context, dataset *ranki
 	return nil
 }
 
-func (m *Master) findUserNeighborsIVF(ctx context.Context, dataset *ranking.DataSet, labelIDF, itemIDF []float32, completed chan struct{}, j *task.JobsAllocator) error {
+func (m *Master) findUserNeighborsIVF(dataset *ranking.DataSet, labelIDF, itemIDF []float32, completed chan struct{}, j *task.JobsAllocator) error {
 	var (
 		updateUserCount     atomic.Float64
 		buildIndexSeconds   atomic.Float64
 		findNeighborSeconds atomic.Float64
 	)
+	ctx := context.Background()
 	// build index
 	buildStart := time.Now()
 	var index search.VectorIndex
 	var vectors []search.Vector
 	switch m.Config.Recommend.UserNeighbors.NeighborType {
 	case config.NeighborTypeSimilar:
-		vectors = lo.Map(dataset.UserFeatures, func(features []lo.Tuple2[int32, float32], _ int) search.Vector {
-			indices, _ := lo.Unzip2(features)
+		vectors = lo.Map(dataset.UserLabels, func(indices []int32, _ int) search.Vector {
 			return search.NewDictionaryVector(indices, labelIDF, nil, false)
 		})
 	case config.NeighborTypeRelated:
@@ -767,8 +768,7 @@ func (m *Master) findUserNeighborsIVF(ctx context.Context, dataset *ranking.Data
 	case config.NeighborTypeAuto:
 		vectors = make([]search.Vector, dataset.UserCount())
 		for i := range vectors {
-			indices, _ := lo.Unzip2(dataset.UserFeatures[i])
-			vectors[i] = NewDualDictionaryVector(indices, labelIDF, dataset.UserFeedback[i], itemIDF, nil, false)
+			vectors[i] = NewDualDictionaryVector(dataset.UserLabels[i], labelIDF, dataset.UserFeedback[i], itemIDF, nil, false)
 		}
 	default:
 		return errors.NotImplementedf("user neighbor type `%v`", m.Config.Recommend.UserNeighbors.NeighborType)
@@ -780,7 +780,8 @@ func (m *Master) findUserNeighborsIVF(ctx context.Context, dataset *ranking.Data
 	index, recall = builder.Build(
 		m.Config.Recommend.UserNeighbors.IndexRecall,
 		m.Config.Recommend.UserNeighbors.IndexFitEpoch,
-		true)
+		true,
+		m.taskMonitor.GetTask(TaskFindUserNeighbors))
 	UserNeighborIndexRecall.Set(float64(recall))
 	if err := m.CacheClient.Set(ctx, cache.String(cache.Key(cache.GlobalMeta, cache.UserNeighborIndexRecall), encoding.FormatFloat32(recall))); err != nil {
 		return errors.Trace(err)
@@ -791,7 +792,6 @@ func (m *Master) findUserNeighborsIVF(ctx context.Context, dataset *ranking.Data
 		defer func() {
 			completed <- struct{}{}
 		}()
-		startSearchTime := time.Now()
 		userId := dataset.UserIndex.ToName(int32(userIndex))
 		if !m.checkUserNeighborCacheTimeout(userId) {
 			return nil
@@ -801,20 +801,12 @@ func (m *Master) findUserNeighborsIVF(ctx context.Context, dataset *ranking.Data
 		var neighbors []int32
 		var scores []float32
 		neighbors, scores = index.Search(vectors[userIndex], m.Config.Recommend.CacheSize, true)
-		resultValues, resultScores := make([]string, len(neighbors)), make([]float64, len(neighbors))
+		itemScores := make([]cache.Scored, len(neighbors))
 		for i := range scores {
-			resultValues[i] = dataset.UserIndex.ToName(neighbors[i])
-			resultScores[i] = float64(-scores[i])
+			itemScores[i].Id = dataset.UserIndex.ToName(neighbors[i])
+			itemScores[i].Score = float64(-scores[i])
 		}
-		aggregator := cache.NewDocumentAggregator(startSearchTime)
-		aggregator.Add("", resultValues, resultScores)
-		if err := m.CacheClient.AddDocuments(ctx, cache.UserNeighbors, userId, aggregator.ToSlice()); err != nil {
-			return errors.Trace(err)
-		}
-		if err := m.CacheClient.DeleteDocuments(ctx, []string{cache.UserNeighbors}, cache.DocumentCondition{
-			Subset: proto.String(userId),
-			Before: &aggregator.Timestamp,
-		}); err != nil {
+		if err := m.CacheClient.SetSorted(ctx, cache.Key(cache.UserNeighbors, userId), itemScores); err != nil {
 			return errors.Trace(err)
 		}
 		if err := m.CacheClient.Set(
@@ -872,7 +864,7 @@ func (m *Master) checkUserNeighborCacheTimeout(userId string) bool {
 	)
 	ctx := context.Background()
 	// check cache
-	if items, err := m.CacheClient.SearchDocuments(ctx, cache.UserNeighbors, userId, []string{""}, 0, -1); err != nil {
+	if items, err := m.CacheClient.GetSorted(ctx, cache.Key(cache.UserNeighbors, userId), 0, -1); err != nil {
 		log.Logger().Error("failed to load user neighbors", zap.String("user_id", userId), zap.Error(err))
 		return true
 	} else if len(items) == 0 {
@@ -927,7 +919,7 @@ func (m *Master) checkItemNeighborCacheTimeout(itemId string, categories []strin
 
 	// check cache
 	for _, category := range append([]string{""}, categories...) {
-		items, err := m.CacheClient.SearchDocuments(ctx, cache.ItemNeighbors, itemId, []string{category}, 0, -1)
+		items, err := m.CacheClient.GetSorted(ctx, cache.Key(cache.ItemNeighbors, itemId, category), 0, -1)
 		if err != nil {
 			log.Logger().Error("failed to load item neighbors", zap.String("item_id", itemId), zap.Error(err))
 			return true
@@ -987,16 +979,14 @@ func (t *FitRankingModelTask) priority() int {
 	return -t.rankingTrainSet.Count()
 }
 
-func (t *FitRankingModelTask) run(ctx context.Context, j *task.JobsAllocator) error {
-	newCtx, span := t.Master.tracer.Start(ctx, "Fit Embedding", 1)
-	defer span.End()
-
+func (t *FitRankingModelTask) run(j *task.JobsAllocator) error {
 	t.rankingDataMutex.RLock()
 	defer t.rankingDataMutex.RUnlock()
 	dataset := t.rankingTrainSet
 	numFeedback := dataset.Count()
 
 	var modelChanged bool
+	ctx := context.Background()
 	bestRankingName, bestRankingModel, bestRankingScore := t.rankingModelSearcher.GetBestModel()
 	t.rankingModelMutex.Lock()
 	if bestRankingModel != nil && !bestRankingModel.Invalid() &&
@@ -1018,7 +1008,7 @@ func (t *FitRankingModelTask) run(ctx context.Context, j *task.JobsAllocator) er
 	t.rankingModelMutex.Unlock()
 
 	if numFeedback == 0 {
-		// t.taskMonitor.Fail(TaskFitRankingModel, "No feedback found.")
+		t.taskMonitor.Fail(TaskFitRankingModel, "No feedback found.")
 		return nil
 	} else if numFeedback == t.lastNumFeedback && !modelChanged {
 		log.Logger().Info("nothing changed")
@@ -1026,7 +1016,9 @@ func (t *FitRankingModelTask) run(ctx context.Context, j *task.JobsAllocator) er
 	}
 
 	startFitTime := time.Now()
-	score := rankingModel.Fit(newCtx, t.rankingTrainSet, t.rankingTestSet, ranking.NewFitConfig().SetJobsAllocator(j))
+	score := rankingModel.Fit(t.rankingTrainSet, t.rankingTestSet, ranking.NewFitConfig().
+		SetJobsAllocator(j).
+		SetTask(t.taskMonitor.Start(TaskFitRankingModel, rankingModel.Complexity())))
 	CollaborativeFilteringFitSeconds.Set(time.Since(startFitTime).Seconds())
 
 	// update ranking model
@@ -1064,7 +1056,7 @@ func (t *FitRankingModelTask) run(ctx context.Context, j *task.JobsAllocator) er
 			zap.Any("ranking_model_params", t.localCache.RankingModel.GetParams()))
 	}
 
-	// t.taskMonitor.Finish(TaskFitRankingModel)
+	t.taskMonitor.Finish(TaskFitRankingModel)
 	t.lastNumFeedback = numFeedback
 	return nil
 }
@@ -1092,10 +1084,7 @@ func (t *FitClickModelTask) priority() int {
 	return -t.clickTrainSet.Count()
 }
 
-func (t *FitClickModelTask) run(ctx context.Context, j *task.JobsAllocator) error {
-	newCtx, span := t.tracer.Start(ctx, "Fit Ranker", 1)
-	defer span.End()
-
+func (t *FitClickModelTask) run(j *task.JobsAllocator) error {
 	log.Logger().Info("prepare to fit click model", zap.Int("n_jobs", t.Config.Master.NumJobs))
 	t.clickDataMutex.RLock()
 	defer t.clickDataMutex.RUnlock()
@@ -1103,10 +1092,12 @@ func (t *FitClickModelTask) run(ctx context.Context, j *task.JobsAllocator) erro
 	numItems := t.clickTrainSet.ItemCount()
 	numFeedback := t.clickTrainSet.Count()
 	var shouldFit bool
+	ctx := context.Background()
 
 	if t.clickTrainSet == nil || numUsers == 0 || numItems == 0 || numFeedback == 0 {
 		log.Logger().Warn("empty ranking dataset",
 			zap.Strings("positive_feedback_type", t.Config.Recommend.DataSource.PositiveFeedbackTypes))
+		t.taskMonitor.Fail(TaskFitClickModel, "No feedback found.")
 		return nil
 	} else if numUsers != t.lastNumUsers ||
 		numItems != t.lastNumItems ||
@@ -1139,8 +1130,9 @@ func (t *FitClickModelTask) run(ctx context.Context, j *task.JobsAllocator) erro
 		return nil
 	}
 	startFitTime := time.Now()
-	score := clickModel.Fit(newCtx, t.clickTrainSet, t.clickTestSet, click.NewFitConfig().
-		SetJobsAllocator(j))
+	score := clickModel.Fit(t.clickTrainSet, t.clickTestSet, click.NewFitConfig().
+		SetJobsAllocator(j).
+		SetTask(t.taskMonitor.Start(TaskFitClickModel, clickModel.Complexity())))
 	RankingFitSeconds.Set(time.Since(startFitTime).Seconds())
 
 	// update match model
@@ -1154,7 +1146,7 @@ func (t *FitClickModelTask) run(ctx context.Context, j *task.JobsAllocator) erro
 	RankingPrecision.Set(float64(score.Precision))
 	RankingRecall.Set(float64(score.Recall))
 	RankingAUC.Set(float64(score.AUC))
-	MemoryInUseBytesVec.WithLabelValues("ranking_model").Set(float64(sizeof.DeepSize(t.ClickModel)))
+	MemoryInUseBytesVec.WithLabelValues("ranking_model").Set(float64(t.ClickModel.Bytes()))
 	if err := t.CacheClient.Set(ctx, cache.Time(cache.Key(cache.GlobalMeta, cache.LastFitRankingModelTime), time.Now())); err != nil {
 		log.Logger().Error("failed to write meta", zap.Error(err))
 	}
@@ -1176,6 +1168,7 @@ func (t *FitClickModelTask) run(ctx context.Context, j *task.JobsAllocator) erro
 			zap.Any("click_model_params", t.localCache.ClickModel.GetParams()))
 	}
 
+	t.taskMonitor.Finish(TaskFitClickModel)
 	t.lastNumItems = numItems
 	t.lastNumUsers = numUsers
 	t.lastNumFeedback = numFeedback
@@ -1203,7 +1196,7 @@ func (t *SearchRankingModelTask) priority() int {
 	return -t.rankingTrainSet.Count()
 }
 
-func (t *SearchRankingModelTask) run(ctx context.Context, j *task.JobsAllocator) error {
+func (t *SearchRankingModelTask) run(j *task.JobsAllocator) error {
 	log.Logger().Info("start searching ranking model")
 	t.rankingDataMutex.RLock()
 	defer t.rankingDataMutex.RUnlock()
@@ -1218,7 +1211,7 @@ func (t *SearchRankingModelTask) run(ctx context.Context, j *task.JobsAllocator)
 	if numUsers == 0 || numItems == 0 || numFeedback == 0 {
 		log.Logger().Warn("empty ranking dataset",
 			zap.Strings("positive_feedback_type", t.Config.Recommend.DataSource.PositiveFeedbackTypes))
-		// t.taskMonitor.Fail(TaskSearchRankingModel, "No feedback found.")
+		t.taskMonitor.Fail(TaskSearchRankingModel, "No feedback found.")
 		return nil
 	} else if numUsers == t.lastNumUsers &&
 		numItems == t.lastNumItems &&
@@ -1228,7 +1221,8 @@ func (t *SearchRankingModelTask) run(ctx context.Context, j *task.JobsAllocator)
 	}
 
 	startTime := time.Now()
-	err := t.rankingModelSearcher.Fit(ctx, t.rankingTrainSet, t.rankingTestSet, nil)
+	err := t.rankingModelSearcher.Fit(t.rankingTrainSet, t.rankingTestSet,
+		t.taskMonitor.Start(TaskSearchRankingModel, t.rankingModelSearcher.Complexity()), j)
 	if err != nil {
 		log.Logger().Error("failed to search collaborative filtering model", zap.Error(err))
 		return nil
@@ -1237,6 +1231,7 @@ func (t *SearchRankingModelTask) run(ctx context.Context, j *task.JobsAllocator)
 	_, _, bestScore := t.rankingModelSearcher.GetBestModel()
 	CollaborativeFilteringSearchPrecision10.Set(float64(bestScore.Precision))
 
+	t.taskMonitor.Finish(TaskSearchRankingModel)
 	t.lastNumItems = numItems
 	t.lastNumUsers = numUsers
 	t.lastNumFeedback = numFeedback
@@ -1264,7 +1259,7 @@ func (t *SearchClickModelTask) priority() int {
 	return -t.clickTrainSet.Count()
 }
 
-func (t *SearchClickModelTask) run(ctx context.Context, j *task.JobsAllocator) error {
+func (t *SearchClickModelTask) run(j *task.JobsAllocator) error {
 	log.Logger().Info("start searching click model")
 	t.clickDataMutex.RLock()
 	defer t.clickDataMutex.RUnlock()
@@ -1279,6 +1274,7 @@ func (t *SearchClickModelTask) run(ctx context.Context, j *task.JobsAllocator) e
 	if numUsers == 0 || numItems == 0 || numFeedback == 0 {
 		log.Logger().Warn("empty click dataset",
 			zap.Strings("positive_feedback_type", t.Config.Recommend.DataSource.PositiveFeedbackTypes))
+		t.taskMonitor.Fail(TaskSearchClickModel, "No feedback found.")
 		return nil
 	} else if numUsers == t.lastNumUsers &&
 		numItems == t.lastNumItems &&
@@ -1288,7 +1284,8 @@ func (t *SearchClickModelTask) run(ctx context.Context, j *task.JobsAllocator) e
 	}
 
 	startTime := time.Now()
-	err := t.clickModelSearcher.Fit(context.Background(), t.clickTrainSet, t.clickTestSet, j)
+	err := t.clickModelSearcher.Fit(t.clickTrainSet, t.clickTestSet,
+		t.taskMonitor.Start(TaskSearchClickModel, t.clickModelSearcher.Complexity()), j)
 	if err != nil {
 		log.Logger().Error("failed to search ranking model", zap.Error(err))
 		return nil
@@ -1297,6 +1294,7 @@ func (t *SearchClickModelTask) run(ctx context.Context, j *task.JobsAllocator) e
 	_, bestScore := t.clickModelSearcher.GetBestModel()
 	RankingSearchPrecision.Set(float64(bestScore.Precision))
 
+	t.taskMonitor.Finish(TaskSearchClickModel)
 	t.lastNumItems = numItems
 	t.lastNumUsers = numUsers
 	t.lastNumFeedback = numFeedback
@@ -1319,13 +1317,15 @@ func (t *CacheGarbageCollectionTask) priority() int {
 	return -t.rankingTrainSet.UserCount() - t.rankingTrainSet.ItemCount()
 }
 
-func (t *CacheGarbageCollectionTask) run(ctx context.Context, j *task.JobsAllocator) error {
+func (t *CacheGarbageCollectionTask) run(j *task.JobsAllocator) error {
 	if t.rankingTrainSet == nil {
 		log.Logger().Debug("dataset has not been loaded")
 		return nil
 	}
+	ctx := context.Background()
 
 	log.Logger().Info("start cache garbage collection")
+	t.taskMonitor.Start(TaskCacheGarbageCollection, t.rankingTrainSet.UserCount()*9+t.rankingTrainSet.ItemCount()*4)
 	var scanCount, reclaimCount int
 	start := time.Now()
 	err := t.CacheClient.Scan(func(s string) error {
@@ -1334,8 +1334,9 @@ func (t *CacheGarbageCollectionTask) run(ctx context.Context, j *task.JobsAlloca
 			return nil
 		}
 		scanCount++
+		t.taskMonitor.Update(TaskCacheGarbageCollection, scanCount)
 		switch splits[0] {
-		case cache.UserNeighbors, cache.UserNeighborsDigest,
+		case cache.UserNeighbors, cache.UserNeighborsDigest, cache.IgnoreItems,
 			cache.OfflineRecommend, cache.OfflineRecommendDigest, cache.CollaborativeRecommend,
 			cache.LastModifyUserTime, cache.LastUpdateUserNeighborsTime, cache.LastUpdateUserRecommendTime:
 			userId := splits[1]
@@ -1353,6 +1354,8 @@ func (t *CacheGarbageCollectionTask) run(ctx context.Context, j *task.JobsAlloca
 			}
 			// delete user cache
 			switch splits[0] {
+			case cache.UserNeighbors, cache.IgnoreItems, cache.CollaborativeRecommend, cache.OfflineRecommend:
+				err = t.CacheClient.SetSorted(ctx, s, nil)
 			case cache.UserNeighborsDigest, cache.OfflineRecommendDigest,
 				cache.LastModifyUserTime, cache.LastUpdateUserNeighborsTime, cache.LastUpdateUserRecommendTime:
 				err = t.CacheClient.Delete(ctx, s)
@@ -1377,6 +1380,8 @@ func (t *CacheGarbageCollectionTask) run(ctx context.Context, j *task.JobsAlloca
 			}
 			// delete item cache
 			switch splits[0] {
+			case cache.ItemNeighbors:
+				err = t.CacheClient.SetSorted(ctx, s, nil)
 			case cache.ItemNeighborsDigest, cache.LastModifyItemTime, cache.LastUpdateItemNeighborsTime:
 				err = t.CacheClient.Delete(ctx, s)
 			}
@@ -1387,6 +1392,11 @@ func (t *CacheGarbageCollectionTask) run(ctx context.Context, j *task.JobsAlloca
 		}
 		return nil
 	})
+	// remove stale hidden items
+	if err := t.CacheClient.RemSortedByScore(ctx, cache.HiddenItemsV2, math.Inf(-1), float64(time.Now().Add(-t.Config.Recommend.CacheExpire).Unix())); err != nil {
+		return errors.Trace(err)
+	}
+	t.taskMonitor.Finish(TaskCacheGarbageCollection)
 	CacheScannedTotal.Set(float64(scanCount))
 	CacheReclaimedTotal.Set(float64(reclaimCount))
 	CacheScannedSeconds.Set(time.Since(start).Seconds())
@@ -1394,22 +1404,19 @@ func (t *CacheGarbageCollectionTask) run(ctx context.Context, j *task.JobsAlloca
 }
 
 // LoadDataFromDatabase loads dataset from data store.
-func (m *Master) LoadDataFromDatabase(ctx context.Context, database data.Database, posFeedbackTypes, readTypes []string, itemTTL, positiveFeedbackTTL uint, evaluator *OnlineEvaluator) (
-	rankingDataset *ranking.DataSet, clickDataset *click.Dataset, latestItems *cache.DocumentAggregator, popularItems *cache.DocumentAggregator, err error) {
-	newCtx, span := progress.Start(ctx, "LoadDataFromDatabase", 4)
-	defer span.End()
-
-	startLoadTime := time.Now()
+func (m *Master) LoadDataFromDatabase(database data.Database, posFeedbackTypes, readTypes []string, itemTTL, positiveFeedbackTTL uint, evaluator *OnlineEvaluator) (
+	rankingDataset *ranking.DataSet, clickDataset *click.Dataset, latestItems map[string][]cache.Scored, popularItems map[string][]cache.Scored, err error) {
+	m.taskMonitor.Start(TaskLoadDataset, 5)
+	ctx := context.Background()
 	// setup time limit
-	var feedbackTimeLimit data.ScanOption
-	var itemTimeLimit *time.Time
+	var itemTimeLimit, feedbackTimeLimit *time.Time
 	if itemTTL > 0 {
 		temp := time.Now().AddDate(0, 0, -int(itemTTL))
 		itemTimeLimit = &temp
 	}
 	if positiveFeedbackTTL > 0 {
 		temp := time.Now().AddDate(0, 0, -int(positiveFeedbackTTL))
-		feedbackTimeLimit = data.WithBeginTime(temp)
+		feedbackTimeLimit = &temp
 	}
 	timeWindowLimit := time.Time{}
 	if m.Config.Recommend.Popular.PopularWindow > 0 {
@@ -1426,38 +1433,31 @@ func (m *Master) LoadDataFromDatabase(ctx context.Context, database data.Databas
 	userLabelFirst := make(map[string]int32)
 	userLabelIndex := base.NewMapIndex()
 	start := time.Now()
-	userChan, errChan := database.GetUserStream(newCtx, batchSize)
+	userChan, errChan := database.GetUserStream(ctx, batchSize)
 	for users := range userChan {
 		for _, user := range users {
 			rankingDataset.AddUser(user.UserId)
 			userIndex := rankingDataset.UserIndex.ToNumber(user.UserId)
-			if len(rankingDataset.UserFeatures) == int(userIndex) {
-				rankingDataset.UserFeatures = append(rankingDataset.UserFeatures, nil)
+			if len(rankingDataset.UserLabels) == int(userIndex) {
+				rankingDataset.UserLabels = append(rankingDataset.UserLabels, nil)
 			}
-			features := click.ConvertLabelsToFeatures(user.Labels)
-			rankingDataset.NumUserLabelUsed += len(features)
-			rankingDataset.UserFeatures[userIndex] = make([]lo.Tuple2[int32, float32], 0, len(features))
-			for _, feature := range features {
-				userLabelCount[feature.Name]++
+			rankingDataset.NumUserLabelUsed += len(user.Labels)
+			rankingDataset.UserLabels[userIndex] = make([]int32, 0, len(user.Labels))
+			for _, label := range user.Labels {
+				userLabelCount[label]++
 				// Memorize the first occurrence.
-				if userLabelCount[feature.Name] == 1 {
-					userLabelFirst[feature.Name] = userIndex
+				if userLabelCount[label] == 1 {
+					userLabelFirst[label] = userIndex
 				}
 				// Add the label to the index in second occurrence.
-				if userLabelCount[feature.Name] == 2 {
-					userLabelIndex.Add(feature.Name)
-					firstUserIndex := userLabelFirst[feature.Name]
-					rankingDataset.UserFeatures[firstUserIndex] = append(rankingDataset.UserFeatures[firstUserIndex], lo.Tuple2[int32, float32]{
-						A: userLabelIndex.ToNumber(feature.Name),
-						B: feature.Value,
-					})
+				if userLabelCount[label] == 2 {
+					userLabelIndex.Add(label)
+					firstUserIndex := userLabelFirst[label]
+					rankingDataset.UserLabels[firstUserIndex] = append(rankingDataset.UserLabels[firstUserIndex], userLabelIndex.ToNumber(label))
 				}
 				// Add the label to the user.
-				if userLabelCount[feature.Name] > 1 {
-					rankingDataset.UserFeatures[userIndex] = append(rankingDataset.UserFeatures[userIndex], lo.Tuple2[int32, float32]{
-						A: userLabelIndex.ToNumber(feature.Name),
-						B: feature.Value,
-					})
+				if userLabelCount[label] > 1 {
+					rankingDataset.UserLabels[userIndex] = append(rankingDataset.UserLabels[userIndex], userLabelIndex.ToNumber(label))
 				}
 			}
 		}
@@ -1466,53 +1466,46 @@ func (m *Master) LoadDataFromDatabase(ctx context.Context, database data.Databas
 		return nil, nil, nil, nil, errors.Trace(err)
 	}
 	rankingDataset.NumUserLabels = userLabelIndex.Len()
+	m.taskMonitor.Update(TaskLoadDataset, 1)
 	log.Logger().Debug("pulled users from database",
 		zap.Int("n_users", rankingDataset.UserCount()),
 		zap.Int32("n_user_labels", userLabelIndex.Len()),
 		zap.Duration("used_time", time.Since(start)))
 	LoadDatasetStepSecondsVec.WithLabelValues("load_users").Set(time.Since(start).Seconds())
-	span.Add(1)
 
 	// STEP 2: pull items
 	itemLabelCount := make(map[string]int)
 	itemLabelFirst := make(map[string]int32)
 	itemLabelIndex := base.NewMapIndex()
 	start = time.Now()
-	itemChan, errChan := database.GetItemStream(newCtx, batchSize, itemTimeLimit)
+	itemChan, errChan := database.GetItemStream(ctx, batchSize, itemTimeLimit)
 	for items := range itemChan {
 		for _, item := range items {
 			rankingDataset.AddItem(item.ItemId)
 			itemIndex := rankingDataset.ItemIndex.ToNumber(item.ItemId)
-			if len(rankingDataset.ItemFeatures) == int(itemIndex) {
-				rankingDataset.ItemFeatures = append(rankingDataset.ItemFeatures, nil)
+			if len(rankingDataset.ItemLabels) == int(itemIndex) {
+				rankingDataset.ItemLabels = append(rankingDataset.ItemLabels, nil)
 				rankingDataset.HiddenItems = append(rankingDataset.HiddenItems, false)
 				rankingDataset.ItemCategories = append(rankingDataset.ItemCategories, item.Categories)
-				rankingDataset.CategorySet.Append(item.Categories...)
+				rankingDataset.CategorySet.Add(item.Categories...)
 			}
-			features := click.ConvertLabelsToFeatures(item.Labels)
-			rankingDataset.NumItemLabelUsed += len(features)
-			rankingDataset.ItemFeatures[itemIndex] = make([]lo.Tuple2[int32, float32], 0, len(features))
-			for _, feature := range features {
-				itemLabelCount[feature.Name]++
+			rankingDataset.NumItemLabelUsed += len(item.Labels)
+			rankingDataset.ItemLabels[itemIndex] = make([]int32, 0, len(item.Labels))
+			for _, label := range item.Labels {
+				itemLabelCount[label]++
 				// Memorize the first occurrence.
-				if itemLabelCount[feature.Name] == 1 {
-					itemLabelFirst[feature.Name] = itemIndex
+				if itemLabelCount[label] == 1 {
+					itemLabelFirst[label] = itemIndex
 				}
 				// Add the label to the index in second occurrence.
-				if itemLabelCount[feature.Name] == 2 {
-					itemLabelIndex.Add(feature.Name)
-					firstItemIndex := itemLabelFirst[feature.Name]
-					rankingDataset.ItemFeatures[firstItemIndex] = append(rankingDataset.ItemFeatures[firstItemIndex], lo.Tuple2[int32, float32]{
-						A: itemLabelIndex.ToNumber(feature.Name),
-						B: feature.Value,
-					})
+				if itemLabelCount[label] == 2 {
+					itemLabelIndex.Add(label)
+					firstItemIndex := itemLabelFirst[label]
+					rankingDataset.ItemLabels[firstItemIndex] = append(rankingDataset.ItemLabels[firstItemIndex], itemLabelIndex.ToNumber(label))
 				}
 				// Add the label to the item.
-				if itemLabelCount[feature.Name] > 1 {
-					rankingDataset.ItemFeatures[itemIndex] = append(rankingDataset.ItemFeatures[itemIndex], lo.Tuple2[int32, float32]{
-						A: itemLabelIndex.ToNumber(feature.Name),
-						B: feature.Value,
-					})
+				if itemLabelCount[label] > 1 {
+					rankingDataset.ItemLabels[itemIndex] = append(rankingDataset.ItemLabels[itemIndex], itemLabelIndex.ToNumber(label))
 				}
 			}
 			if item.IsHidden { // set hidden flag
@@ -1532,126 +1525,88 @@ func (m *Master) LoadDataFromDatabase(ctx context.Context, database data.Databas
 		return nil, nil, nil, nil, errors.Trace(err)
 	}
 	rankingDataset.NumItemLabels = itemLabelIndex.Len()
+	m.taskMonitor.Update(TaskLoadDataset, 2)
 	log.Logger().Debug("pulled items from database",
 		zap.Int("n_items", rankingDataset.ItemCount()),
 		zap.Int32("n_item_labels", itemLabelIndex.Len()),
 		zap.Duration("used_time", time.Since(start)))
 	LoadDatasetStepSecondsVec.WithLabelValues("load_items").Set(time.Since(start).Seconds())
-	span.Add(1)
 
 	// create positive set
 	popularCount := make([]int32, rankingDataset.ItemCount())
-	positiveSet := make([]mapset.Set[int32], rankingDataset.UserCount())
+	positiveSet := make([]*i32set.Set, rankingDataset.UserCount())
 	for i := range positiveSet {
-		positiveSet[i] = mapset.NewSet[int32]()
+		positiveSet[i] = i32set.New()
 	}
-
-	// split user groups
-	users := rankingDataset.UserIndex.GetNames()
-	sort.Strings(users)
-	userGroups := parallel.Split(users, m.Config.Master.NumJobs)
 
 	// STEP 3: pull positive feedback
-	var mu sync.Mutex
-	var posFeedbackCount int
+	var feedbackCount float64
 	start = time.Now()
-	err = parallel.Parallel(len(userGroups), m.Config.Master.NumJobs, func(_, userIndex int) error {
-		feedbackChan, errChan := database.GetFeedbackStream(newCtx, batchSize,
-			data.WithBeginUserId(userGroups[userIndex][0]),
-			data.WithEndUserId(userGroups[userIndex][len(userGroups[userIndex])-1]),
-			feedbackTimeLimit,
-			data.WithEndTime(*m.Config.Now()),
-			data.WithFeedbackTypes(posFeedbackTypes...))
-		for feedback := range feedbackChan {
-			for _, f := range feedback {
-				// convert user and item id to index
-				userIndex := rankingDataset.UserIndex.ToNumber(f.UserId)
-				if userIndex == base.NotId {
-					continue
-				}
-				itemIndex := rankingDataset.ItemIndex.ToNumber(f.ItemId)
-				if itemIndex == base.NotId {
-					continue
-				}
-				// insert feedback to positive set
-				positiveSet[userIndex].Add(itemIndex)
-
-				mu.Lock()
-				posFeedbackCount++
-				// insert feedback to ranking dataset
-				rankingDataset.AddFeedback(f.UserId, f.ItemId, false)
-				// insert feedback to popularity counter
-				if f.Timestamp.After(timeWindowLimit) && !rankingDataset.HiddenItems[itemIndex] {
-					popularCount[itemIndex]++
-				}
-				// insert feedback to evaluator
-				evaluator.Positive(f.FeedbackType, userIndex, itemIndex, f.Timestamp)
-				mu.Unlock()
+	feedbackChan, errChan := database.GetFeedbackStream(ctx, batchSize, feedbackTimeLimit, m.Config.Now(), posFeedbackTypes...)
+	for feedback := range feedbackChan {
+		for _, f := range feedback {
+			feedbackCount++
+			rankingDataset.AddFeedback(f.UserId, f.ItemId, false)
+			// insert feedback to positive set
+			userIndex := rankingDataset.UserIndex.ToNumber(f.UserId)
+			if userIndex == base.NotId {
+				continue
 			}
+			itemIndex := rankingDataset.ItemIndex.ToNumber(f.ItemId)
+			if itemIndex == base.NotId {
+				continue
+			}
+			positiveSet[userIndex].Add(itemIndex)
+			// insert feedback to popularity counter
+			if f.Timestamp.After(timeWindowLimit) && !rankingDataset.HiddenItems[itemIndex] {
+				popularCount[itemIndex]++
+			}
+			evaluator.Positive(f.FeedbackType, userIndex, itemIndex, f.Timestamp)
 		}
-		if err = <-errChan; err != nil {
-			return errors.Trace(err)
-		}
-		return nil
-	})
-	if err != nil {
+	}
+	if err = <-errChan; err != nil {
 		return nil, nil, nil, nil, errors.Trace(err)
 	}
+	m.taskMonitor.Update(TaskLoadDataset, 3)
 	log.Logger().Debug("pulled positive feedback from database",
-		zap.Int("n_positive_feedback", posFeedbackCount),
+		zap.Int("n_positive_feedback", rankingDataset.Count()),
 		zap.Duration("used_time", time.Since(start)))
 	LoadDatasetStepSecondsVec.WithLabelValues("load_positive_feedback").Set(time.Since(start).Seconds())
-	span.Add(1)
 
 	// create negative set
-	negativeSet := make([]mapset.Set[int32], rankingDataset.UserCount())
+	negativeSet := make([]*i32set.Set, rankingDataset.UserCount())
 	for i := range negativeSet {
-		negativeSet[i] = mapset.NewSet[int32]()
+		negativeSet[i] = i32set.New()
 	}
 
 	// STEP 4: pull negative feedback
 	start = time.Now()
-	var negativeFeedbackCount float64
-	err = parallel.Parallel(len(userGroups), m.Config.Master.NumJobs, func(_, userIndex int) error {
-		feedbackChan, errChan := database.GetFeedbackStream(newCtx, batchSize,
-			data.WithBeginUserId(userGroups[userIndex][0]),
-			data.WithEndUserId(userGroups[userIndex][len(userGroups[userIndex])-1]),
-			feedbackTimeLimit,
-			data.WithEndTime(*m.Config.Now()),
-			data.WithFeedbackTypes(readTypes...))
-		for feedback := range feedbackChan {
-			for _, f := range feedback {
-				userIndex := rankingDataset.UserIndex.ToNumber(f.UserId)
-				if userIndex == base.NotId {
-					continue
-				}
-				itemIndex := rankingDataset.ItemIndex.ToNumber(f.ItemId)
-				if itemIndex == base.NotId {
-					continue
-				}
-				if !positiveSet[userIndex].Contains(itemIndex) {
-					negativeSet[userIndex].Add(itemIndex)
-				}
-
-				mu.Lock()
-				negativeFeedbackCount++
-				evaluator.Read(userIndex, itemIndex, f.Timestamp)
-				mu.Unlock()
+	feedbackChan, errChan = database.GetFeedbackStream(ctx, batchSize, feedbackTimeLimit, m.Config.Now(), readTypes...)
+	for feedback := range feedbackChan {
+		for _, f := range feedback {
+			feedbackCount++
+			userIndex := rankingDataset.UserIndex.ToNumber(f.UserId)
+			if userIndex == base.NotId {
+				continue
 			}
+			itemIndex := rankingDataset.ItemIndex.ToNumber(f.ItemId)
+			if itemIndex == base.NotId {
+				continue
+			}
+			if !positiveSet[userIndex].Has(itemIndex) {
+				negativeSet[userIndex].Add(itemIndex)
+			}
+			evaluator.Read(userIndex, itemIndex, f.Timestamp)
 		}
-		if err = <-errChan; err != nil {
-			return errors.Trace(err)
-		}
-		return nil
-	})
-	if err != nil {
+	}
+	if err = <-errChan; err != nil {
 		return nil, nil, nil, nil, errors.Trace(err)
 	}
+	m.taskMonitor.Update(TaskLoadDataset, 4)
+	FeedbacksTotal.Set(feedbackCount)
 	log.Logger().Debug("pulled negative feedback from database",
-		zap.Int("n_negative_feedback", int(negativeFeedbackCount)),
 		zap.Duration("used_time", time.Since(start)))
 	LoadDatasetStepSecondsVec.WithLabelValues("load_negative_feedback").Set(time.Since(start).Seconds())
-	span.Add(1)
 
 	// STEP 5: create click dataset
 	start = time.Now()
@@ -1662,27 +1617,29 @@ func (m *Master) LoadDataFromDatabase(ctx context.Context, database data.Databas
 	unifiedIndex.UserLabelIndex = userLabelIndex
 	clickDataset = &click.Dataset{
 		Index:        unifiedIndex.Build(),
-		UserFeatures: rankingDataset.UserFeatures,
-		ItemFeatures: rankingDataset.ItemFeatures,
+		UserFeatures: rankingDataset.UserLabels,
+		ItemFeatures: rankingDataset.ItemLabels,
 	}
 	for userIndex := range positiveSet {
-		if positiveSet[userIndex].Cardinality() == 0 || negativeSet[userIndex].Cardinality() == 0 {
+		if positiveSet[userIndex].IsEmpty() || negativeSet[userIndex].IsEmpty() {
 			// release positive set and negative set
 			positiveSet[userIndex] = nil
 			negativeSet[userIndex] = nil
 			continue
 		}
 		// insert positive feedback
-		for _, itemIndex := range positiveSet[userIndex].ToSlice() {
+		for _, itemIndex := range positiveSet[userIndex].List() {
 			clickDataset.Users.Append(int32(userIndex))
 			clickDataset.Items.Append(itemIndex)
+			clickDataset.NormValues.Append(1 / math32.Sqrt(float32(len(clickDataset.UserFeatures[userIndex])+len(clickDataset.ItemFeatures[itemIndex]))))
 			clickDataset.Target.Append(1)
 			clickDataset.PositiveCount++
 		}
 		// insert negative feedback
-		for _, itemIndex := range negativeSet[userIndex].ToSlice() {
+		for _, itemIndex := range negativeSet[userIndex].List() {
 			clickDataset.Users.Append(int32(userIndex))
 			clickDataset.Items.Append(itemIndex)
+			clickDataset.NormValues.Append(1 / math32.Sqrt(float32(len(clickDataset.UserFeatures[userIndex])+len(clickDataset.ItemFeatures[itemIndex]))))
 			clickDataset.Target.Append(-1)
 			clickDataset.NegativeCount++
 		}
@@ -1694,13 +1651,14 @@ func (m *Master) LoadDataFromDatabase(ctx context.Context, database data.Databas
 		zap.Int("n_valid_positive", clickDataset.PositiveCount),
 		zap.Int("n_valid_negative", clickDataset.NegativeCount),
 		zap.Duration("used_time", time.Since(start)))
+	m.taskMonitor.Update(TaskLoadDataset, 5)
 	LoadDatasetStepSecondsVec.WithLabelValues("create_ranking_dataset").Set(time.Since(start).Seconds())
 
 	// collect latest items
-	latestItems = cache.NewDocumentAggregator(startLoadTime)
+	latestItems = make(map[string][]cache.Scored)
 	for category, latestItemsFilter := range latestItemsFilters {
 		items, scores := latestItemsFilter.PopAll()
-		latestItems.Add(category, items, scores)
+		latestItems[category] = cache.CreateScoredItems(items, scores)
 	}
 
 	// collect popular items
@@ -1716,11 +1674,12 @@ func (m *Master) LoadDataFromDatabase(ctx context.Context, database data.Databas
 			popularItemFilters[category].Push(itemId, float64(val))
 		}
 	}
-	popularItems = cache.NewDocumentAggregator(startLoadTime)
+	popularItems = make(map[string][]cache.Scored)
 	for category, popularItemFilter := range popularItemFilters {
 		items, scores := popularItemFilter.PopAll()
-		popularItems.Add(category, items, scores)
+		popularItems[category] = cache.CreateScoredItems(items, scores)
 	}
 
+	m.taskMonitor.Finish(TaskLoadDataset)
 	return rankingDataset, clickDataset, latestItems, popularItems, nil
 }

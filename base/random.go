@@ -18,7 +18,8 @@ import (
 	"math/rand"
 	"sync"
 
-	mapset "github.com/deckarep/golang-set/v2"
+	"github.com/scylladb/go-set/i32set"
+	"github.com/scylladb/go-set/iset"
 )
 
 // RandomGenerator is the random generator for gorse.
@@ -59,14 +60,6 @@ func (rng RandomGenerator) NormalMatrix(row, col int, mean, stdDev float32) [][]
 	return ret
 }
 
-func (rng RandomGenerator) NormalVector(size int, mean, stdDev float32) []float32 {
-	ret := make([]float32, size)
-	for i := 0; i < len(ret); i++ {
-		ret[i] = float32(rng.NormFloat64())*stdDev + mean
-	}
-	return ret
-}
-
 // UniformMatrix makes a matrix filled with uniform random floats.
 func (rng RandomGenerator) UniformMatrix(row, col int, low, high float32) [][]float32 {
 	ret := make([][]float32, row)
@@ -86,16 +79,13 @@ func (rng RandomGenerator) NormalVector64(size int, mean, stdDev float64) []floa
 }
 
 // Sample n values between low and high, but not in exclude.
-func (rng RandomGenerator) Sample(low, high, n int, exclude ...mapset.Set[int]) []int {
+func (rng RandomGenerator) Sample(low, high, n int, exclude ...*iset.Set) []int {
 	intervalLength := high - low
-	excludeSet := mapset.NewSet[int]()
-	for _, set := range exclude {
-		excludeSet = excludeSet.Union(set)
-	}
+	excludeSet := iset.Union(exclude...)
 	sampled := make([]int, 0, n)
-	if n >= intervalLength-excludeSet.Cardinality() {
+	if n >= intervalLength-excludeSet.Size() {
 		for i := low; i < high; i++ {
-			if !excludeSet.Contains(i) {
+			if !excludeSet.Has(i) {
 				sampled = append(sampled, i)
 				excludeSet.Add(i)
 			}
@@ -103,7 +93,7 @@ func (rng RandomGenerator) Sample(low, high, n int, exclude ...mapset.Set[int]) 
 	} else {
 		for len(sampled) < n {
 			v := rng.Intn(intervalLength) + low
-			if !excludeSet.Contains(v) {
+			if !excludeSet.Has(v) {
 				sampled = append(sampled, v)
 				excludeSet.Add(v)
 			}
@@ -113,16 +103,13 @@ func (rng RandomGenerator) Sample(low, high, n int, exclude ...mapset.Set[int]) 
 }
 
 // SampleInt32 n 32bit values between low and high, but not in exclude.
-func (rng RandomGenerator) SampleInt32(low, high int32, n int, exclude ...mapset.Set[int32]) []int32 {
+func (rng RandomGenerator) SampleInt32(low, high int32, n int, exclude ...*i32set.Set) []int32 {
 	intervalLength := high - low
-	excludeSet := mapset.NewSet[int32]()
-	for _, set := range exclude {
-		excludeSet = excludeSet.Union(set)
-	}
+	excludeSet := i32set.Union(exclude...)
 	sampled := make([]int32, 0, n)
-	if n >= int(intervalLength)-excludeSet.Cardinality() {
+	if n >= int(intervalLength)-excludeSet.Size() {
 		for i := low; i < high; i++ {
-			if !excludeSet.Contains(i) {
+			if !excludeSet.Has(i) {
 				sampled = append(sampled, i)
 				excludeSet.Add(i)
 			}
@@ -130,7 +117,7 @@ func (rng RandomGenerator) SampleInt32(low, high int32, n int, exclude ...mapset
 	} else {
 		for len(sampled) < n {
 			v := rng.Int31n(intervalLength) + low
-			if !excludeSet.Contains(v) {
+			if !excludeSet.Has(v) {
 				sampled = append(sampled, v)
 				excludeSet.Add(v)
 			}

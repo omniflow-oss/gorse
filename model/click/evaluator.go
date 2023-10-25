@@ -15,12 +15,10 @@
 package click
 
 import (
-	"sort"
-
 	"github.com/chewxy/math32"
-	"github.com/samber/lo"
 	"github.com/zhenghaoz/gorse/base/copier"
 	"modernc.org/sortutil"
+	"sort"
 )
 
 // EvaluateRegression evaluates factorization machines in regression task.
@@ -32,7 +30,7 @@ func EvaluateRegression(estimator FactorizationMachine, testSet *Dataset) Score 
 		prediction := estimator.InternalPredict(features, values)
 		sum += (target - prediction) * (target - prediction)
 	}
-	if testSet.Count() == 0 {
+	if 0 == testSet.Count() {
 		return Score{
 			Task: FMRegression,
 			RMSE: 0,
@@ -47,28 +45,17 @@ func EvaluateRegression(estimator FactorizationMachine, testSet *Dataset) Score 
 // EvaluateClassification evaluates factorization machines in classification task.
 func EvaluateClassification(estimator FactorizationMachine, testSet *Dataset) Score {
 	// For all UserFeedback
-	var posFeatures, negFeatures []lo.Tuple2[[]int32, []float32]
-	for i := 0; i < testSet.Count(); i++ {
-		indices, values, target := testSet.Get(i)
-		if target > 0 {
-			posFeatures = append(posFeatures, lo.Tuple2[[]int32, []float32]{A: indices, B: values})
-		} else {
-			negFeatures = append(negFeatures, lo.Tuple2[[]int32, []float32]{A: indices, B: values})
-		}
-	}
 	var posPrediction, negPrediction []float32
-	if batchInference, ok := estimator.(BatchInference); ok {
-		posPrediction = batchInference.BatchInternalPredict(posFeatures)
-		negPrediction = batchInference.BatchInternalPredict(negFeatures)
-	} else {
-		for _, features := range posFeatures {
-			posPrediction = append(posPrediction, estimator.InternalPredict(features.A, features.B))
-		}
-		for _, features := range negFeatures {
-			negPrediction = append(negPrediction, estimator.InternalPredict(features.A, features.B))
+	for i := 0; i < testSet.Count(); i++ {
+		features, values, target := testSet.Get(i)
+		prediction := estimator.InternalPredict(features, values)
+		if target > 0 {
+			posPrediction = append(posPrediction, prediction)
+		} else {
+			negPrediction = append(negPrediction, prediction)
 		}
 	}
-	if testSet.Count() == 0 {
+	if 0 == testSet.Count() {
 		return Score{
 			Task:      FMClassification,
 			Precision: 0,

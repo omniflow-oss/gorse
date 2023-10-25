@@ -15,34 +15,21 @@
 package protocol
 
 import (
+	"github.com/stretchr/testify/assert"
+	"github.com/zhenghaoz/gorse/base/task"
 	"testing"
 	"time"
-
-	"github.com/stretchr/testify/assert"
-	"github.com/zhenghaoz/gorse/base/progress"
 )
 
 func TestEncodeDecode(t *testing.T) {
-	progressList := []progress.Progress{
-		{
-			Tracer:     "tracer",
-			Name:       "a",
-			Total:      100,
-			Count:      50,
-			Status:     progress.StatusRunning,
-			StartTime:  time.Date(2018, time.January, 1, 0, 0, 0, 0, time.Local),
-			FinishTime: time.Date(2018, time.January, 2, 0, 0, 0, 0, time.Local),
-		},
-		{
-			Tracer:     "tracer",
-			Name:       "b",
-			Total:      100,
-			Count:      50,
-			Status:     progress.StatusRunning,
-			StartTime:  time.Date(2018, time.January, 1, 0, 0, 0, 0, time.Local),
-			FinishTime: time.Date(2018, time.January, 2, 0, 0, 0, 0, time.Local),
-		},
+	tk := &task.Task{
+		Name:       "a",
+		Total:      100,
+		Done:       50,
+		Status:     task.StatusRunning,
+		StartTime:  time.Date(2018, time.January, 1, 0, 0, 0, 0, time.Local),
+		FinishTime: time.Date(2018, time.January, 2, 0, 0, 0, 0, time.Local),
 	}
-	pb := EncodeProgress(progressList)
-	assert.Equal(t, progressList, DecodeProgress(pb))
+	pb := EncodeTask(tk)
+	assert.Equal(t, tk, DecodeTask(pb))
 }

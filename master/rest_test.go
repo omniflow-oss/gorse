@@ -28,6 +28,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/emicklei/go-restful/v3"
 	"github.com/juju/errors"
 	"github.com/mitchellh/mapstructure"
@@ -40,7 +41,6 @@ import (
 	"github.com/zhenghaoz/gorse/server"
 	"github.com/zhenghaoz/gorse/storage/cache"
 	"github.com/zhenghaoz/gorse/storage/data"
-	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -49,31 +49,34 @@ const (
 )
 
 type mockServer struct {
-	handler *restful.Container
+	dataStoreServer  *miniredis.Miniredis
+	cacheStoreServer *miniredis.Miniredis
+	handler          *restful.Container
 	Master
 }
 
 func newMockServer(t *testing.T) (*mockServer, string) {
 	s := new(mockServer)
-	// open database
+	// create mock redis server
 	var err error
+	s.dataStoreServer, err = miniredis.Run()
+	assert.NoError(t, err)
+	s.cacheStoreServer, err = miniredis.Run()
+	assert.NoError(t, err)
+	// open database
 	s.Settings = config.NewSettings()
-	s.DataClient, err = data.Open(fmt.Sprintf("sqlite://%s/data.db", t.TempDir()), "")
+	s.DataClient, err = data.Open("redis://"+s.dataStoreServer.Addr(), "")
 	assert.NoError(t, err)
-	s.CacheClient, err = cache.Open(fmt.Sprintf("sqlite://%s/cache.db", t.TempDir()), "")
-	assert.NoError(t, err)
-	// init database
-	err = s.DataClient.Init()
-	assert.NoError(t, err)
-	err = s.CacheClient.Init()
+	s.CacheClient, err = cache.Open("redis://"+s.cacheStoreServer.Addr(), "")
 	assert.NoError(t, err)
 	// create server
 	s.Config = config.GetDefaultConfig()
 	s.Config.Master.DashboardUserName = mockMasterUsername
 	s.Config.Master.DashboardPassword = mockMasterPassword
+	s.RestServer.HiddenItemsManager = server.NewHiddenItemsManager(&s.RestServer)
+	s.RestServer.PopularItemsCache = server.NewPopularItemsCache(&s.RestServer)
 	s.WebService = new(restful.WebService)
 	s.CreateWebService()
-	s.RestServer.CreateWebService()
 	// create handler
 	s.handler = restful.NewContainer()
 	s.handler.Add(s.WebService)
@@ -93,6 +96,8 @@ func (s *mockServer) Close(t *testing.T) {
 	assert.NoError(t, err)
 	err = s.CacheClient.Close()
 	assert.NoError(t, err)
+	s.dataStoreServer.Close()
+	s.cacheStoreServer.Close()
 }
 
 func marshal(t *testing.T, v interface{}) string {
@@ -114,9 +119,9 @@ func TestMaster_ExportUsers(t *testing.T) {
 	ctx := context.Background()
 	// insert users
 	users := []data.User{
-		{UserId: "1", Labels: map[string]any{"gender": "male", "job": "engineer"}},
-		{UserId: "2", Labels: map[string]any{"gender": "male", "job": "lawyer"}},
-		{UserId: "3", Labels: map[string]any{"gender": "female", "job": "teacher"}},
+		{UserId: "1", Labels: []string{"a", "b"}},
+		{UserId: "2", Labels: []string{"b", "c"}},
+		{UserId: "3", Labels: []string{"c", "d"}},
 	}
 	err := s.DataClient.BatchInsertUsers(ctx, users)
 	assert.NoError(t, err)
@@ -129,9 +134,9 @@ func TestMaster_ExportUsers(t *testing.T) {
 	assert.Equal(t, "text/csv", w.Header().Get("Content-Type"))
 	assert.Equal(t, "attachment;filename=users.csv", w.Header().Get("Content-Disposition"))
 	assert.Equal(t, "user_id,labels\r\n"+
-		"1,\"{\"\"gender\"\":\"\"male\"\",\"\"job\"\":\"\"engineer\"\"}\"\r\n"+
-		"2,\"{\"\"gender\"\":\"\"male\"\",\"\"job\"\":\"\"lawyer\"\"}\"\r\n"+
-		"3,\"{\"\"gender\"\":\"\"female\"\",\"\"job\"\":\"\"teacher\"\"}\"\r\n", w.Body.String())
+		"1,a|b\r\n"+
+		"2,b|c\r\n"+
+		"3,c|d\r\n", w.Body.String())
 }
 
 func TestMaster_ExportItems(t *testing.T) {
@@ -140,30 +145,9 @@ func TestMaster_ExportItems(t *testing.T) {
 	ctx := context.Background()
 	// insert items
 	items := []data.Item{
-		{
-			ItemId:     "1",
-			IsHidden:   false,
-			Categories: []string{"x"},
-			Timestamp:  time.Date(2020, 1, 1, 1, 1, 1, 1, time.UTC),
-			Labels:     map[string]any{"genre": []string{"comedy", "sci-fi"}},
-			Comment:    "o,n,e",
-		},
-		{
-			ItemId:     "2",
-			IsHidden:   false,
-			Categories: []string{"x", "y"},
-			Timestamp:  time.Date(2021, 1, 1, 1, 1, 1, 1, time.UTC),
-			Labels:     map[string]any{"genre": []string{"documentary", "sci-fi"}},
-			Comment:    "t\r\nw\r\no",
-		},
-		{
-			ItemId:     "3",
-			IsHidden:   true,
-			Categories: nil,
-			Timestamp:  time.Date(2022, 1, 1, 1, 1, 1, 1, time.UTC),
-			Labels:     nil,
-			Comment:    "\"three\"",
-		},
+		{"1", false, []string{"x"}, time.Date(2020, 1, 1, 1, 1, 1, 1, time.UTC), []string{"a", "b"}, "o,n,e"},
+		{"2", false, []string{"x", "y"}, time.Date(2021, 1, 1, 1, 1, 1, 1, time.UTC), []string{"b", "c"}, "t\r\nw\r\no"},
+		{"3", true, nil, time.Date(2022, 1, 1, 1, 1, 1, 1, time.UTC), nil, "\"three\""},
 	}
 	err := s.DataClient.BatchInsertItems(ctx, items)
 	assert.NoError(t, err)
@@ -176,9 +160,9 @@ func TestMaster_ExportItems(t *testing.T) {
 	assert.Equal(t, "text/csv", w.Header().Get("Content-Type"))
 	assert.Equal(t, "attachment;filename=items.csv", w.Header().Get("Content-Disposition"))
 	assert.Equal(t, "item_id,is_hidden,categories,time_stamp,labels,description\r\n"+
-		"1,false,x,2020-01-01 01:01:01.000000001 +0000 UTC,\"{\"\"genre\"\":[\"\"comedy\"\",\"\"sci-fi\"\"]}\",\"o,n,e\"\r\n"+
-		"2,false,x|y,2021-01-01 01:01:01.000000001 +0000 UTC,\"{\"\"genre\"\":[\"\"documentary\"\",\"\"sci-fi\"\"]}\",\"t\r\nw\r\no\"\r\n"+
-		"3,true,,2022-01-01 01:01:01.000000001 +0000 UTC,null,\"\"\"three\"\"\"\r\n", w.Body.String())
+		"1,false,x,2020-01-01 01:01:01.000000001 +0000 UTC,a|b,\"o,n,e\"\r\n"+
+		"2,false,x|y,2021-01-01 01:01:01.000000001 +0000 UTC,b|c,\"t\r\nw\r\no\"\r\n"+
+		"3,true,,2022-01-01 01:01:01.000000001 +0000 UTC,,\"\"\"three\"\"\"\r\n", w.Body.String())
 }
 
 func TestMaster_ExportFeedback(t *testing.T) {
@@ -226,9 +210,9 @@ func TestMaster_ImportUsers(t *testing.T) {
 	assert.NoError(t, err)
 	file, err := writer.CreateFormFile("file", "users.csv")
 	assert.NoError(t, err)
-	_, err = file.Write([]byte("\"{\"\"gender\"\":\"\"male\"\",\"\"job\"\":\"\"engineer\"\"}\"\t1\n" +
-		"\"{\"\"gender\"\":\"\"male\"\",\"\"job\"\":\"\"lawyer\"\"}\"\t2\n" +
-		"\"{\"\"gender\"\":\"\"female\"\",\"\"job\"\":\"\"teacher\"\"}\"\t\"3\"\n"))
+	_, err = file.Write([]byte("a::b\t1\n" +
+		"b::c\t2\n" +
+		"\"c::d\"\t\"3\"\n"))
 	assert.NoError(t, err)
 	err = writer.Close()
 	assert.NoError(t, err)
@@ -243,9 +227,9 @@ func TestMaster_ImportUsers(t *testing.T) {
 	_, items, err := s.DataClient.GetUsers(ctx, "", 100)
 	assert.NoError(t, err)
 	assert.Equal(t, []data.User{
-		{UserId: "1", Labels: map[string]any{"gender": "male", "job": "engineer"}},
-		{UserId: "2", Labels: map[string]any{"gender": "male", "job": "lawyer"}},
-		{UserId: "3", Labels: map[string]any{"gender": "female", "job": "teacher"}},
+		{UserId: "1", Labels: []string{"a", "b"}},
+		{UserId: "2", Labels: []string{"b", "c"}},
+		{UserId: "3", Labels: []string{"c", "d"}},
 	}, items)
 }
 
@@ -259,9 +243,9 @@ func TestMaster_ImportUsers_DefaultFormat(t *testing.T) {
 	file, err := writer.CreateFormFile("file", "users.csv")
 	assert.NoError(t, err)
 	_, err = file.Write([]byte("user_id,labels\r\n" +
-		"1,\"{\"\"性别\"\":\"\"男\"\",\"\"职业\"\":\"\"工程师\"\"}\"\r\n" +
-		"2,\"{\"\"性别\"\":\"\"男\"\",\"\"职业\"\":\"\"律师\"\"}\"\r\n" +
-		"\"3\",\"{\"\"性别\"\":\"\"女\"\",\"\"职业\"\":\"\"教师\"\"}\"\r\n"))
+		"1,a|用例\r\n" +
+		"2,b|乱码\r\n" +
+		"\"3\",\"c|测试\"\r\n"))
 	assert.NoError(t, err)
 	err = writer.Close()
 	assert.NoError(t, err)
@@ -276,9 +260,9 @@ func TestMaster_ImportUsers_DefaultFormat(t *testing.T) {
 	_, items, err := s.DataClient.GetUsers(ctx, "", 100)
 	assert.NoError(t, err)
 	assert.Equal(t, []data.User{
-		{UserId: "1", Labels: map[string]any{"性别": "男", "职业": "工程师"}},
-		{UserId: "2", Labels: map[string]any{"性别": "男", "职业": "律师"}},
-		{UserId: "3", Labels: map[string]any{"性别": "女", "职业": "教师"}},
+		{UserId: "1", Labels: []string{"a", "用例"}},
+		{UserId: "2", Labels: []string{"b", "乱码"}},
+		{UserId: "3", Labels: []string{"c", "测试"}},
 	}, items)
 }
 
@@ -300,9 +284,9 @@ func TestMaster_ImportItems(t *testing.T) {
 	assert.NoError(t, err)
 	file, err := writer.CreateFormFile("file", "items.csv")
 	assert.NoError(t, err)
-	_, err = file.Write([]byte("1\t\"{\"\"genre\"\":[\"\"comedy\"\",\"\"sci-fi\"\"]}\"\t\"o,n,e\"\t2020-01-01 01:01:01.000000001 +0000 UTC\tx\t0\n" +
-		"2\t\"{\"\"genre\"\":[\"\"documentary\"\",\"\"sci-fi\"\"]}\"\t\"t\r\nw\r\no\"\t2021-01-01 01:01:01.000000001 +0000 UTC\tx::y\t0\n" +
-		"\"3\"\t\"\"\t\"\"\"three\"\"\"\t\"2022-01-01 01:01:01.000000001 +0000 UTC\"\t\t\"1\"\n"))
+	_, err = file.Write([]byte("1\ta::b\t\"o,n,e\"\t2020-01-01 01:01:01.000000001 +0000 UTC\tx\t0\n" +
+		"2\tb::c\t\"t\r\nw\r\no\"\t2021-01-01 01:01:01.000000001 +0000 UTC\tx::y\t0\n" +
+		"\"3\"\t\"c::d\"\t\"\"\"three\"\"\"\t\"2022-01-01 01:01:01.000000001 +0000 UTC\"\t\t\"1\"\n"))
 	assert.NoError(t, err)
 	err = writer.Close()
 	assert.NoError(t, err)
@@ -317,30 +301,9 @@ func TestMaster_ImportItems(t *testing.T) {
 	_, items, err := s.DataClient.GetItems(ctx, "", 100, nil)
 	assert.NoError(t, err)
 	assert.Equal(t, []data.Item{
-		{
-			ItemId:     "1",
-			IsHidden:   false,
-			Categories: []string{"x"},
-			Timestamp:  time.Date(2020, 1, 1, 1, 1, 1, 1, time.UTC),
-			Labels:     map[string]any{"genre": []any{"comedy", "sci-fi"}},
-			Comment:    "o,n,e",
-		},
-		{
-			ItemId:     "2",
-			IsHidden:   false,
-			Categories: []string{"x", "y"},
-			Timestamp:  time.Date(2021, 1, 1, 1, 1, 1, 1, time.UTC),
-			Labels:     map[string]any{"genre": []any{"documentary", "sci-fi"}},
-			Comment:    "t\r\nw\r\no",
-		},
-		{
-			ItemId:     "3",
-			IsHidden:   true,
-			Categories: nil,
-			Timestamp:  time.Date(2022, 1, 1, 1, 1, 1, 1, time.UTC),
-			Labels:     nil,
-			Comment:    "\"three\"",
-		},
+		{"1", false, []string{"x"}, time.Date(2020, 1, 1, 1, 1, 1, 1, time.UTC), []string{"a", "b"}, "o,n,e"},
+		{"2", false, []string{"x", "y"}, time.Date(2021, 1, 1, 1, 1, 1, 1, time.UTC), []string{"b", "c"}, "t\r\nw\r\no"},
+		{"3", true, nil, time.Date(2022, 1, 1, 1, 1, 1, 1, time.UTC), []string{"c", "d"}, "\"three\""},
 	}, items)
 }
 
@@ -355,8 +318,8 @@ func TestMaster_ImportItems_DefaultFormat(t *testing.T) {
 	file, err := writer.CreateFormFile("file", "items.csv")
 	assert.NoError(t, err)
 	_, err = file.Write([]byte("item_id,is_hidden,categories,time_stamp,labels,description\r\n" +
-		"1,false,x,2020-01-01 01:01:01.000000001 +0000 UTC,\"{\"\"类型\"\":[\"\"喜剧\"\",\"\"科幻\"\"]}\",one\r\n" +
-		"2,false,x|y,2021-01-01 01:01:01.000000001 +0000 UTC,\"{\"\"类型\"\":[\"\"卡通\"\",\"\"科幻\"\"]}\",two\r\n" +
+		"1,false,x,2020-01-01 01:01:01.000000001 +0000 UTC,a|b,one\r\n" +
+		"2,false,x|y,2021-01-01 01:01:01.000000001 +0000 UTC,b|c,two\r\n" +
 		"\"3\",\"true\",,\"2022-01-01 01:01:01.000000001 +0000 UTC\",,\"three\"\r\n"))
 	assert.NoError(t, err)
 	err = writer.Close()
@@ -372,29 +335,9 @@ func TestMaster_ImportItems_DefaultFormat(t *testing.T) {
 	_, items, err := s.DataClient.GetItems(ctx, "", 100, nil)
 	assert.NoError(t, err)
 	assert.Equal(t, []data.Item{
-		{
-			ItemId:     "1",
-			IsHidden:   false,
-			Categories: []string{"x"},
-			Timestamp:  time.Date(2020, 1, 1, 1, 1, 1, 1, time.UTC),
-			Labels:     map[string]any{"类型": []any{"喜剧", "科幻"}},
-			Comment:    "one"},
-		{
-			ItemId:     "2",
-			IsHidden:   false,
-			Categories: []string{"x", "y"},
-			Timestamp:  time.Date(2021, 1, 1, 1, 1, 1, 1, time.UTC),
-			Labels:     map[string]any{"类型": []any{"卡通", "科幻"}},
-			Comment:    "two",
-		},
-		{
-			ItemId:     "3",
-			IsHidden:   true,
-			Categories: nil,
-			Timestamp:  time.Date(2022, 1, 1, 1, 1, 1, 1, time.UTC),
-			Labels:     nil,
-			Comment:    "three",
-		},
+		{"1", false, []string{"x"}, time.Date(2020, 1, 1, 1, 1, 1, 1, time.UTC), []string{"a", "b"}, "one"},
+		{"2", false, []string{"x", "y"}, time.Date(2021, 1, 1, 1, 1, 1, 1, time.UTC), []string{"b", "c"}, "two"},
+		{"3", true, nil, time.Date(2022, 1, 1, 1, 1, 1, 1, time.UTC), nil, "three"},
 	}, items)
 }
 
@@ -533,16 +476,19 @@ func TestMaster_GetRates(t *testing.T) {
 	// write rates
 	s.Config.Recommend.DataSource.PositiveFeedbackTypes = []string{"a", "b"}
 	// This first measurement should be overwritten.
-	baseTimestamp := time.Now()
-	err := s.CacheClient.AddTimeSeriesPoints(ctx, []cache.TimeSeriesPoint{
-		{Name: cache.Key(PositiveFeedbackRate, "a"), Value: 100.0, Timestamp: baseTimestamp.Add(-2 * 24 * time.Hour)},
-		{Name: cache.Key(PositiveFeedbackRate, "a"), Value: 2.0, Timestamp: baseTimestamp.Add(-2 * 24 * time.Hour)},
-		{Name: cache.Key(PositiveFeedbackRate, "a"), Value: 2.0, Timestamp: baseTimestamp.Add(-1 * 24 * time.Hour)},
-		{Name: cache.Key(PositiveFeedbackRate, "a"), Value: 3.0, Timestamp: baseTimestamp.Add(-0 * 24 * time.Hour)},
-		{Name: cache.Key(PositiveFeedbackRate, "b"), Value: 20.0, Timestamp: baseTimestamp.Add(-2 * 24 * time.Hour)},
-		{Name: cache.Key(PositiveFeedbackRate, "b"), Value: 20.0, Timestamp: baseTimestamp.Add(-1 * 24 * time.Hour)},
-		{Name: cache.Key(PositiveFeedbackRate, "b"), Value: 30.0, Timestamp: baseTimestamp.Add(-0 * 24 * time.Hour)},
-	})
+	err := s.RestServer.InsertMeasurement(ctx, server.Measurement{Name: cache.Key(PositiveFeedbackRate, "a"), Value: 100.0, Timestamp: time.Date(2000, 1, 1, 1, 1, 1, 0, time.UTC)})
+	assert.NoError(t, err)
+	err = s.RestServer.InsertMeasurement(ctx, server.Measurement{Name: cache.Key(PositiveFeedbackRate, "a"), Value: 2.0, Timestamp: time.Date(2000, 1, 1, 1, 1, 1, 0, time.UTC)})
+	assert.NoError(t, err)
+	err = s.RestServer.InsertMeasurement(ctx, server.Measurement{Name: cache.Key(PositiveFeedbackRate, "a"), Value: 2.0, Timestamp: time.Date(2000, 1, 2, 1, 1, 1, 0, time.UTC)})
+	assert.NoError(t, err)
+	err = s.RestServer.InsertMeasurement(ctx, server.Measurement{Name: cache.Key(PositiveFeedbackRate, "a"), Value: 3.0, Timestamp: time.Date(2000, 1, 3, 1, 1, 1, 0, time.UTC)})
+	assert.NoError(t, err)
+	err = s.RestServer.InsertMeasurement(ctx, server.Measurement{Name: cache.Key(PositiveFeedbackRate, "b"), Value: 20.0, Timestamp: time.Date(2000, 1, 1, 1, 1, 1, 0, time.UTC)})
+	assert.NoError(t, err)
+	err = s.RestServer.InsertMeasurement(ctx, server.Measurement{Name: cache.Key(PositiveFeedbackRate, "b"), Value: 20.0, Timestamp: time.Date(2000, 1, 2, 1, 1, 1, 0, time.UTC)})
+	assert.NoError(t, err)
+	err = s.RestServer.InsertMeasurement(ctx, server.Measurement{Name: cache.Key(PositiveFeedbackRate, "b"), Value: 30.0, Timestamp: time.Date(2000, 1, 3, 1, 1, 1, 0, time.UTC)})
 	assert.NoError(t, err)
 
 	// get rates
@@ -552,16 +498,16 @@ func TestMaster_GetRates(t *testing.T) {
 		Header("Cookie", cookie).
 		Expect(t).
 		Status(http.StatusOK).
-		Body(marshal(t, map[string][]cache.TimeSeriesPoint{
+		Body(marshal(t, map[string][]server.Measurement{
 			"a": {
-				{Name: cache.Key(PositiveFeedbackRate, "a"), Value: 2.0, Timestamp: baseTimestamp.Add(-2 * 24 * time.Hour)},
-				{Name: cache.Key(PositiveFeedbackRate, "a"), Value: 2.0, Timestamp: baseTimestamp.Add(-1 * 24 * time.Hour)},
-				{Name: cache.Key(PositiveFeedbackRate, "a"), Value: 3.0, Timestamp: baseTimestamp.Add(-0 * 24 * time.Hour)},
+				{Name: cache.Key(PositiveFeedbackRate, "a"), Value: 3.0, Timestamp: time.Date(2000, 1, 3, 1, 1, 1, 0, time.UTC)},
+				{Name: cache.Key(PositiveFeedbackRate, "a"), Value: 2.0, Timestamp: time.Date(2000, 1, 2, 1, 1, 1, 0, time.UTC)},
+				{Name: cache.Key(PositiveFeedbackRate, "a"), Value: 2.0, Timestamp: time.Date(2000, 1, 1, 1, 1, 1, 0, time.UTC)},
 			},
 			"b": {
-				{Name: cache.Key(PositiveFeedbackRate, "b"), Value: 20.0, Timestamp: baseTimestamp.Add(-2 * 24 * time.Hour)},
-				{Name: cache.Key(PositiveFeedbackRate, "b"), Value: 20.0, Timestamp: baseTimestamp.Add(-1 * 24 * time.Hour)},
-				{Name: cache.Key(PositiveFeedbackRate, "b"), Value: 30.0, Timestamp: baseTimestamp.Add(-0 * 24 * time.Hour)},
+				{Name: cache.Key(PositiveFeedbackRate, "b"), Value: 30.0, Timestamp: time.Date(2000, 1, 3, 1, 1, 1, 0, time.UTC)},
+				{Name: cache.Key(PositiveFeedbackRate, "b"), Value: 20.0, Timestamp: time.Date(2000, 1, 2, 1, 1, 1, 0, time.UTC)},
+				{Name: cache.Key(PositiveFeedbackRate, "b"), Value: 20.0, Timestamp: time.Date(2000, 1, 1, 1, 1, 1, 0, time.UTC)},
 			},
 		})).
 		End()
@@ -626,36 +572,37 @@ func TestMaster_GetUsers(t *testing.T) {
 		End()
 }
 
-func TestServer_SearchDocumentsOfItems(t *testing.T) {
+func TestServer_SortedItems(t *testing.T) {
 	s, cookie := newMockServer(t)
 	defer s.Close(t)
 	type ListOperator struct {
-		Name       string
-		Collection string
-		Subset     string
-		Category   string
-		Get        string
+		Name   string
+		Prefix string
+		Label  string
+		Get    string
 	}
 	ctx := context.Background()
 	operators := []ListOperator{
-		{"Item Neighbors", cache.ItemNeighbors, "0", "", "/api/dashboard/item/0/neighbors"},
-		{"Item Neighbors in Category", cache.ItemNeighbors, "0", "*", "/api/dashboard/item/0/neighbors/*"},
-		{"Latest Items", cache.LatestItems, "", "", "/api/dashboard/latest/"},
-		{"Popular Items", cache.PopularItems, "", "", "/api/dashboard/popular/"},
-		{"Latest Items in Category", cache.LatestItems, "", "*", "/api/dashboard/latest/*"},
-		{"Popular Items in Category", cache.PopularItems, "", "*", "/api/dashboard/popular/*"},
+		{"Item Neighbors", cache.ItemNeighbors, "0", "/api/dashboard/item/0/neighbors"},
+		{"Item Neighbors in Category", cache.ItemNeighbors, "0/*", "/api/dashboard/item/0/neighbors/*"},
+		{"Latest Items", cache.LatestItems, "", "/api/dashboard/latest/"},
+		{"Popular Items", cache.PopularItems, "", "/api/dashboard/popular/"},
+		{"Latest Items in Category", cache.LatestItems, "*", "/api/dashboard/latest/*"},
+		{"Popular Items in Category", cache.PopularItems, "*", "/api/dashboard/popular/*"},
 	}
 	for i, operator := range operators {
 		t.Run(operator.Name, func(t *testing.T) {
 			// Put scores
-			scores := []cache.Document{
-				{Id: strconv.Itoa(i) + "0", Score: 100, Categories: []string{operator.Category}},
-				{Id: strconv.Itoa(i) + "1", Score: 99, Categories: []string{operator.Category}},
-				{Id: strconv.Itoa(i) + "2", Score: 98, Categories: []string{operator.Category}},
-				{Id: strconv.Itoa(i) + "3", Score: 97, Categories: []string{operator.Category}},
-				{Id: strconv.Itoa(i) + "4", Score: 96, Categories: []string{operator.Category}},
+			scores := []cache.Scored{
+				{strconv.Itoa(i) + "0", 100},
+				{strconv.Itoa(i) + "1", 99},
+				{strconv.Itoa(i) + "2", 98},
+				{strconv.Itoa(i) + "3", 97},
+				{strconv.Itoa(i) + "4", 96},
 			}
-			err := s.CacheClient.AddDocuments(ctx, operator.Collection, operator.Subset, scores)
+			err := s.CacheClient.SetSorted(ctx, cache.Key(operator.Prefix, operator.Label), scores)
+			assert.NoError(t, err)
+			err = server.NewCacheModification(s.CacheClient, s.HiddenItemsManager).HideItem(strconv.Itoa(i) + "3").Exec()
 			assert.NoError(t, err)
 			items := make([]ScoredItem, 0)
 			for _, score := range scores {
@@ -663,15 +610,6 @@ func TestServer_SearchDocumentsOfItems(t *testing.T) {
 				err = s.DataClient.BatchInsertItems(ctx, []data.Item{{ItemId: score.Id}})
 				assert.NoError(t, err)
 			}
-			// hide item
-			apitest.New().
-				Handler(s.handler).
-				Patch("/api/item/"+strconv.Itoa(i)+"3").
-				Header("Cookie", cookie).
-				JSON(data.ItemPatch{IsHidden: proto.Bool(true)}).
-				Expect(t).
-				Status(http.StatusOK).
-				End()
 			apitest.New().
 				Handler(s.handler).
 				Get(operator.Get).
@@ -684,7 +622,7 @@ func TestServer_SearchDocumentsOfItems(t *testing.T) {
 	}
 }
 
-func TestServer_SearchDocumentsOfUsers(t *testing.T) {
+func TestServer_SortedUsers(t *testing.T) {
 	s, cookie := newMockServer(t)
 	defer s.Close(t)
 	type ListOperator struct {
@@ -699,14 +637,14 @@ func TestServer_SearchDocumentsOfUsers(t *testing.T) {
 	for _, operator := range operators {
 		t.Logf("test RESTful API: %v", operator.Get)
 		// Put scores
-		scores := []cache.Document{
-			{Id: "0", Score: 100, Categories: []string{""}},
-			{Id: "1", Score: 99, Categories: []string{""}},
-			{Id: "2", Score: 98, Categories: []string{""}},
-			{Id: "3", Score: 97, Categories: []string{""}},
-			{Id: "4", Score: 96, Categories: []string{""}},
+		scores := []cache.Scored{
+			{"0", 100},
+			{"1", 99},
+			{"2", 98},
+			{"3", 97},
+			{"4", 96},
 		}
-		err := s.CacheClient.AddDocuments(ctx, operator.Prefix, operator.Label, scores)
+		err := s.CacheClient.SetSorted(ctx, cache.Key(operator.Prefix, operator.Label), scores)
 		assert.NoError(t, err)
 		users := make([]ScoreUser, 0)
 		for _, score := range scores {
@@ -758,25 +696,25 @@ func TestServer_GetRecommends(t *testing.T) {
 	s, cookie := newMockServer(t)
 	defer s.Close(t)
 	// inset recommendation
-	itemIds := []cache.Document{
-		{Id: "1", Score: 99, Categories: []string{""}},
-		{Id: "2", Score: 98, Categories: []string{""}},
-		{Id: "3", Score: 97, Categories: []string{""}},
-		{Id: "4", Score: 96, Categories: []string{""}},
-		{Id: "5", Score: 95, Categories: []string{""}},
-		{Id: "6", Score: 94, Categories: []string{""}},
-		{Id: "7", Score: 93, Categories: []string{""}},
-		{Id: "8", Score: 92, Categories: []string{""}},
+	itemIds := []cache.Scored{
+		{"1", 99},
+		{"2", 98},
+		{"3", 97},
+		{"4", 96},
+		{"5", 95},
+		{"6", 94},
+		{"7", 93},
+		{"8", 92},
 	}
 	ctx := context.Background()
-	err := s.CacheClient.AddDocuments(ctx, cache.OfflineRecommend, "0", itemIds)
+	err := s.CacheClient.SetSorted(ctx, cache.Key(cache.OfflineRecommend, "0"), itemIds)
 	assert.NoError(t, err)
 	// insert feedback
 	feedback := []data.Feedback{
 		{FeedbackKey: data.FeedbackKey{FeedbackType: "a", UserId: "0", ItemId: "2"}},
 		{FeedbackKey: data.FeedbackKey{FeedbackType: "a", UserId: "0", ItemId: "4"}},
 	}
-	err = s.DataClient.BatchInsertFeedback(ctx, feedback, true, true, true)
+	err = s.RestServer.InsertFeedbackToCache(ctx, feedback)
 	assert.NoError(t, err)
 	// insert items
 	for _, item := range itemIds {
@@ -825,17 +763,11 @@ func TestMaster_Purge(t *testing.T) {
 	assert.NoError(t, err)
 	assert.ElementsMatch(t, []string{"a", "b", "c"}, set)
 
-	err = s.CacheClient.AddDocuments(ctx, "sorted", "", []cache.Document{
-		{Id: "a", Score: 1, Categories: []string{""}},
-		{Id: "b", Score: 2, Categories: []string{""}},
-		{Id: "c", Score: 3, Categories: []string{""}}})
+	err = s.CacheClient.AddSorted(ctx, cache.Sorted("sorted", []cache.Scored{{Id: "a", Score: 1}, {Id: "b", Score: 2}, {Id: "c", Score: 3}}))
 	assert.NoError(t, err)
-	z, err := s.CacheClient.SearchDocuments(ctx, "sorted", "", []string{""}, 0, -1)
+	z, err := s.CacheClient.GetSorted(ctx, "sorted", 0, -1)
 	assert.NoError(t, err)
-	assert.ElementsMatch(t, []cache.Document{
-		{Id: "a", Score: 1, Categories: []string{""}},
-		{Id: "b", Score: 2, Categories: []string{""}},
-		{Id: "c", Score: 3, Categories: []string{""}}}, z)
+	assert.ElementsMatch(t, []cache.Scored{{Id: "a", Score: 1}, {Id: "b", Score: 2}, {Id: "c", Score: 3}}, z)
 
 	err = s.DataClient.BatchInsertFeedback(ctx, lo.Map(lo.Range(100), func(t int, i int) data.Feedback {
 		return data.Feedback{FeedbackKey: data.FeedbackKey{
@@ -869,7 +801,7 @@ func TestMaster_Purge(t *testing.T) {
 	set, err = s.CacheClient.GetSet(ctx, "set")
 	assert.NoError(t, err)
 	assert.Empty(t, set)
-	z, err = s.CacheClient.SearchDocuments(ctx, "sorted", "", []string{""}, 0, -1)
+	z, err = s.CacheClient.GetSorted(ctx, "sorted", 0, -1)
 	assert.NoError(t, err)
 	assert.Empty(t, z)
 

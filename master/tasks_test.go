@@ -16,139 +16,39 @@ package master
 
 import (
 	"context"
-	"runtime"
 	"strconv"
+	"testing"
 	"time"
 
-	"github.com/samber/lo"
+	"github.com/juju/errors"
+	"github.com/stretchr/testify/assert"
+	"github.com/zhenghaoz/gorse/base/task"
 	"github.com/zhenghaoz/gorse/config"
 	"github.com/zhenghaoz/gorse/storage/cache"
 	"github.com/zhenghaoz/gorse/storage/data"
 )
 
-func (s *MasterTestSuite) TestFindItemNeighborsBruteForce() {
-	ctx := context.Background()
-	// create config
-	s.Config = &config.Config{}
-	s.Config.Recommend.CacheSize = 3
-	s.Config.Master.NumJobs = 4
-	// collect similar
-	items := []data.Item{
-		{ItemId: "0", IsHidden: false, Categories: []string{"*"}, Timestamp: time.Now(), Labels: []string{"a", "b", "c", "d"}, Comment: ""},
-		{ItemId: "1", IsHidden: false, Categories: []string{"*"}, Timestamp: time.Now(), Labels: []string{}, Comment: ""},
-		{ItemId: "2", IsHidden: false, Categories: []string{"*"}, Timestamp: time.Now(), Labels: []string{"b", "c", "d"}, Comment: ""},
-		{ItemId: "3", IsHidden: false, Categories: nil, Timestamp: time.Now(), Labels: []string{}, Comment: ""},
-		{ItemId: "4", IsHidden: false, Categories: nil, Timestamp: time.Now(), Labels: []string{"b", "c"}, Comment: ""},
-		{ItemId: "5", IsHidden: false, Categories: []string{"*"}, Timestamp: time.Now(), Labels: []string{}, Comment: ""},
-		{ItemId: "6", IsHidden: false, Categories: []string{"*"}, Timestamp: time.Now(), Labels: []string{"c"}, Comment: ""},
-		{ItemId: "7", IsHidden: false, Categories: []string{"*"}, Timestamp: time.Now(), Labels: []string{}, Comment: ""},
-		{ItemId: "8", IsHidden: false, Categories: []string{"*"}, Timestamp: time.Now(), Labels: []string{"a", "b", "c", "d", "e"}, Comment: ""},
-		{ItemId: "9", IsHidden: false, Categories: nil, Timestamp: time.Now(), Labels: []string{}, Comment: ""},
-	}
-	feedbacks := make([]data.Feedback, 0)
-	for i := 0; i < 10; i++ {
-		for j := 0; j <= i; j++ {
-			if i%2 == 1 {
-				feedbacks = append(feedbacks, data.Feedback{
-					FeedbackKey: data.FeedbackKey{
-						ItemId:       strconv.Itoa(i),
-						UserId:       strconv.Itoa(j),
-						FeedbackType: "FeedbackType",
-					},
-					Timestamp: time.Now(),
-				})
-			}
-		}
-	}
-	var err error
-	err = s.DataClient.BatchInsertItems(ctx, items)
-	s.NoError(err)
-	err = s.DataClient.BatchInsertFeedback(ctx, feedbacks, true, true, true)
-	s.NoError(err)
-
-	// insert hidden item
-	err = s.DataClient.BatchInsertItems(ctx, []data.Item{{
-		ItemId:   "10",
-		Labels:   []string{"a", "b", "c", "d", "e"},
-		IsHidden: true,
-	}})
-	s.NoError(err)
-	for i := 0; i <= 10; i++ {
-		err = s.DataClient.BatchInsertFeedback(ctx, []data.Feedback{{
-			FeedbackKey: data.FeedbackKey{UserId: strconv.Itoa(i), ItemId: "10", FeedbackType: "FeedbackType"},
-		}}, true, true, true)
-		s.NoError(err)
-	}
-
-	// load mock dataset
-	dataset, _, _, _, err := s.LoadDataFromDatabase(context.Background(), s.DataClient, []string{"FeedbackType"}, nil, 0, 0, NewOnlineEvaluator())
-	s.NoError(err)
-	s.rankingTrainSet = dataset
-
-	// similar items (common users)
-	s.Config.Recommend.ItemNeighbors.NeighborType = config.NeighborTypeRelated
-	neighborTask := NewFindItemNeighborsTask(&s.Master)
-	s.NoError(neighborTask.run(context.Background(), nil))
-	similar, err := s.CacheClient.SearchDocuments(ctx, cache.ItemNeighbors, "9", []string{""}, 0, 100)
-	s.NoError(err)
-	s.Equal([]string{"7", "5", "3"}, cache.ConvertDocumentsToValues(similar))
-	// similar items in category (common users)
-	similar, err = s.CacheClient.SearchDocuments(ctx, cache.ItemNeighbors, "9", []string{"*"}, 0, 100)
-	s.NoError(err)
-	s.Equal([]string{"7", "5", "1"}, cache.ConvertDocumentsToValues(similar))
-
-	// similar items (common labels)
-	err = s.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastModifyItemTime, "8"), time.Now()))
-	s.NoError(err)
-	s.Config.Recommend.ItemNeighbors.NeighborType = config.NeighborTypeSimilar
-	neighborTask = NewFindItemNeighborsTask(&s.Master)
-	s.NoError(neighborTask.run(context.Background(), nil))
-	similar, err = s.CacheClient.SearchDocuments(ctx, cache.ItemNeighbors, "8", []string{""}, 0, 100)
-	s.NoError(err)
-	s.Equal([]string{"0", "2", "4"}, cache.ConvertDocumentsToValues(similar))
-	// similar items in category (common labels)
-	similar, err = s.CacheClient.SearchDocuments(ctx, cache.ItemNeighbors, "8", []string{"*"}, 0, 100)
-	s.NoError(err)
-	s.Equal([]string{"0", "2", "6"}, cache.ConvertDocumentsToValues(similar))
-
-	// similar items (auto)
-	err = s.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastModifyItemTime, "8"), time.Now()))
-	s.NoError(err)
-	err = s.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastModifyItemTime, "9"), time.Now()))
-	s.NoError(err)
-	s.Config.Recommend.ItemNeighbors.NeighborType = config.NeighborTypeAuto
-	neighborTask = NewFindItemNeighborsTask(&s.Master)
-	s.NoError(neighborTask.run(context.Background(), nil))
-	similar, err = s.CacheClient.SearchDocuments(ctx, cache.ItemNeighbors, "8", []string{""}, 0, 100)
-	s.NoError(err)
-	s.Equal([]string{"0", "2", "4"}, cache.ConvertDocumentsToValues(similar))
-	similar, err = s.CacheClient.SearchDocuments(ctx, cache.ItemNeighbors, "9", []string{""}, 0, 100)
-	s.NoError(err)
-	s.Equal([]string{"7", "5", "3"}, cache.ConvertDocumentsToValues(similar))
-}
-
-func (s *MasterTestSuite) TestFindItemNeighborsIVF() {
+func TestMaster_FindItemNeighborsBruteForce(t *testing.T) {
 	// create mock master
+	m := newMockMaster(t)
+	defer m.Close()
 	ctx := context.Background()
 	// create config
-	s.Config = &config.Config{}
-	s.Config.Recommend.CacheSize = 3
-	s.Config.Master.NumJobs = 4
-	s.Config.Recommend.ItemNeighbors.EnableIndex = true
-	s.Config.Recommend.ItemNeighbors.IndexRecall = 1
-	s.Config.Recommend.ItemNeighbors.IndexFitEpoch = 10
+	m.Config = &config.Config{}
+	m.Config.Recommend.CacheSize = 3
+	m.Config.Master.NumJobs = 4
 	// collect similar
 	items := []data.Item{
-		{ItemId: "0", IsHidden: false, Categories: []string{"*"}, Timestamp: time.Now(), Labels: []string{"a", "b", "c", "d"}, Comment: ""},
-		{ItemId: "1", IsHidden: false, Categories: []string{"*"}, Timestamp: time.Now(), Labels: []string{}, Comment: ""},
-		{ItemId: "2", IsHidden: false, Categories: []string{"*"}, Timestamp: time.Now(), Labels: []string{"b", "c", "d"}, Comment: ""},
-		{ItemId: "3", IsHidden: false, Categories: nil, Timestamp: time.Now(), Labels: []string{}, Comment: ""},
-		{ItemId: "4", IsHidden: false, Categories: nil, Timestamp: time.Now(), Labels: []string{"b", "c"}, Comment: ""},
-		{ItemId: "5", IsHidden: false, Categories: []string{"*"}, Timestamp: time.Now(), Labels: []string{}, Comment: ""},
-		{ItemId: "6", IsHidden: false, Categories: []string{"*"}, Timestamp: time.Now(), Labels: []string{"c"}, Comment: ""},
-		{ItemId: "7", IsHidden: false, Categories: []string{"*"}, Timestamp: time.Now(), Labels: []string{}, Comment: ""},
-		{ItemId: "8", IsHidden: false, Categories: []string{"*"}, Timestamp: time.Now(), Labels: []string{"a", "b", "c", "d", "e"}, Comment: ""},
-		{ItemId: "9", IsHidden: false, Categories: nil, Timestamp: time.Now(), Labels: []string{}, Comment: ""},
+		{"0", false, []string{"*"}, time.Now(), []string{"a", "b", "c", "d"}, ""},
+		{"1", false, []string{"*"}, time.Now(), []string{}, ""},
+		{"2", false, []string{"*"}, time.Now(), []string{"b", "c", "d"}, ""},
+		{"3", false, nil, time.Now(), []string{}, ""},
+		{"4", false, nil, time.Now(), []string{"b", "c"}, ""},
+		{"5", false, []string{"*"}, time.Now(), []string{}, ""},
+		{"6", false, []string{"*"}, time.Now(), []string{"c"}, ""},
+		{"7", false, []string{"*"}, time.Now(), []string{}, ""},
+		{"8", false, []string{"*"}, time.Now(), []string{"a", "b", "c", "d", "e"}, ""},
+		{"9", false, nil, time.Now(), []string{}, ""},
 	}
 	feedbacks := make([]data.Feedback, 0)
 	for i := 0; i < 10; i++ {
@@ -166,132 +66,257 @@ func (s *MasterTestSuite) TestFindItemNeighborsIVF() {
 		}
 	}
 	var err error
-	err = s.DataClient.BatchInsertItems(ctx, items)
-	s.NoError(err)
-	err = s.DataClient.BatchInsertFeedback(ctx, feedbacks, true, true, true)
-	s.NoError(err)
+	err = m.DataClient.BatchInsertItems(ctx, items)
+	assert.NoError(t, err)
+	err = m.DataClient.BatchInsertFeedback(ctx, feedbacks, true, true, true)
+	assert.NoError(t, err)
 
 	// insert hidden item
-	err = s.DataClient.BatchInsertItems(ctx, []data.Item{{
+	err = m.DataClient.BatchInsertItems(ctx, []data.Item{{
 		ItemId:   "10",
 		Labels:   []string{"a", "b", "c", "d", "e"},
 		IsHidden: true,
 	}})
-	s.NoError(err)
+	assert.NoError(t, err)
 	for i := 0; i <= 10; i++ {
-		err = s.DataClient.BatchInsertFeedback(ctx, []data.Feedback{{
+		err = m.DataClient.BatchInsertFeedback(ctx, []data.Feedback{{
 			FeedbackKey: data.FeedbackKey{UserId: strconv.Itoa(i), ItemId: "10", FeedbackType: "FeedbackType"},
 		}}, true, true, true)
-		s.NoError(err)
+		assert.NoError(t, err)
 	}
 
 	// load mock dataset
-	dataset, _, _, _, err := s.LoadDataFromDatabase(context.Background(), s.DataClient, []string{"FeedbackType"}, nil, 0, 0, NewOnlineEvaluator())
-	s.NoError(err)
-	s.rankingTrainSet = dataset
+	dataset, _, _, _, err := m.LoadDataFromDatabase(m.DataClient, []string{"FeedbackType"}, nil, 0, 0, NewOnlineEvaluator())
+	assert.NoError(t, err)
+	m.rankingTrainSet = dataset
 
 	// similar items (common users)
-	s.Config.Recommend.ItemNeighbors.NeighborType = config.NeighborTypeRelated
-	neighborTask := NewFindItemNeighborsTask(&s.Master)
-	s.NoError(neighborTask.run(context.Background(), nil))
-	similar, err := s.CacheClient.SearchDocuments(ctx, cache.ItemNeighbors, "9", []string{""}, 0, 100)
-	s.NoError(err)
-	s.Equal([]string{"7", "5", "3"}, cache.ConvertDocumentsToValues(similar))
+	m.Config.Recommend.ItemNeighbors.NeighborType = config.NeighborTypeRelated
+	neighborTask := NewFindItemNeighborsTask(&m.Master)
+	assert.NoError(t, neighborTask.run(nil))
+	similar, err := m.CacheClient.GetSorted(ctx, cache.Key(cache.ItemNeighbors, "9"), 0, 100)
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"7", "5", "3"}, cache.RemoveScores(similar))
+	assert.Equal(t, m.estimateFindItemNeighborsComplexity(dataset), m.taskMonitor.Tasks[TaskFindItemNeighbors].Done)
+	assert.Equal(t, task.StatusComplete, m.taskMonitor.Tasks[TaskFindItemNeighbors].Status)
 	// similar items in category (common users)
-	similar, err = s.CacheClient.SearchDocuments(ctx, cache.ItemNeighbors, "9", []string{"*"}, 0, 100)
-	s.NoError(err)
-	s.Equal([]string{"7", "5", "1"}, cache.ConvertDocumentsToValues(similar))
+	similar, err = m.CacheClient.GetSorted(ctx, cache.Key(cache.ItemNeighbors, "9", "*"), 0, 100)
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"7", "5", "1"}, cache.RemoveScores(similar))
 
 	// similar items (common labels)
-	err = s.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastModifyItemTime, "8"), time.Now()))
-	s.NoError(err)
-	s.Config.Recommend.ItemNeighbors.NeighborType = config.NeighborTypeSimilar
-	neighborTask = NewFindItemNeighborsTask(&s.Master)
-	s.NoError(neighborTask.run(context.Background(), nil))
-	similar, err = s.CacheClient.SearchDocuments(ctx, cache.ItemNeighbors, "8", []string{""}, 0, 100)
-	s.NoError(err)
-	s.Equal([]string{"0", "2", "4"}, cache.ConvertDocumentsToValues(similar))
+	err = m.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastModifyItemTime, "8"), time.Now()))
+	assert.NoError(t, err)
+	m.Config.Recommend.ItemNeighbors.NeighborType = config.NeighborTypeSimilar
+	neighborTask = NewFindItemNeighborsTask(&m.Master)
+	assert.NoError(t, neighborTask.run(nil))
+	similar, err = m.CacheClient.GetSorted(ctx, cache.Key(cache.ItemNeighbors, "8"), 0, 100)
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"0", "2", "4"}, cache.RemoveScores(similar))
+	assert.Equal(t, m.estimateFindItemNeighborsComplexity(dataset), m.taskMonitor.Tasks[TaskFindItemNeighbors].Done)
+	assert.Equal(t, task.StatusComplete, m.taskMonitor.Tasks[TaskFindItemNeighbors].Status)
 	// similar items in category (common labels)
-	similar, err = s.CacheClient.SearchDocuments(ctx, cache.ItemNeighbors, "8", []string{"*"}, 0, 100)
-	s.NoError(err)
-	s.Equal([]string{"0", "2", "6"}, cache.ConvertDocumentsToValues(similar))
+	similar, err = m.CacheClient.GetSorted(ctx, cache.Key(cache.ItemNeighbors, "8", "*"), 0, 100)
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"0", "2", "6"}, cache.RemoveScores(similar))
 
 	// similar items (auto)
-	err = s.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastModifyItemTime, "8"), time.Now()))
-	s.NoError(err)
-	err = s.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastModifyItemTime, "9"), time.Now()))
-	s.NoError(err)
-	s.Config.Recommend.ItemNeighbors.NeighborType = config.NeighborTypeAuto
-	neighborTask = NewFindItemNeighborsTask(&s.Master)
-	s.NoError(neighborTask.run(context.Background(), nil))
-	similar, err = s.CacheClient.SearchDocuments(ctx, cache.ItemNeighbors, "8", []string{""}, 0, 100)
-	s.NoError(err)
-	s.Equal([]string{"0", "2", "4"}, cache.ConvertDocumentsToValues(similar))
-	similar, err = s.CacheClient.SearchDocuments(ctx, cache.ItemNeighbors, "9", []string{""}, 0, 100)
-	s.NoError(err)
-	s.Equal([]string{"7", "5", "3"}, cache.ConvertDocumentsToValues(similar))
+	err = m.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastModifyItemTime, "8"), time.Now()))
+	assert.NoError(t, err)
+	err = m.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastModifyItemTime, "9"), time.Now()))
+	assert.NoError(t, err)
+	m.Config.Recommend.ItemNeighbors.NeighborType = config.NeighborTypeAuto
+	neighborTask = NewFindItemNeighborsTask(&m.Master)
+	assert.NoError(t, neighborTask.run(nil))
+	similar, err = m.CacheClient.GetSorted(ctx, cache.Key(cache.ItemNeighbors, "8"), 0, 100)
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"0", "2", "4"}, cache.RemoveScores(similar))
+	similar, err = m.CacheClient.GetSorted(ctx, cache.Key(cache.ItemNeighbors, "9"), 0, 100)
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"7", "5", "3"}, cache.RemoveScores(similar))
+	assert.Equal(t, m.estimateFindItemNeighborsComplexity(dataset), m.taskMonitor.Tasks[TaskFindItemNeighbors].Done)
+	assert.Equal(t, task.StatusComplete, m.taskMonitor.Tasks[TaskFindItemNeighbors].Status)
 }
 
-func (s *MasterTestSuite) TestFindItemNeighborsIVF_ZeroIDF() {
+func TestMaster_FindItemNeighborsIVF(t *testing.T) {
+	// create mock master
+	m := newMockMaster(t)
+	defer m.Close()
 	ctx := context.Background()
 	// create config
-	s.Config = &config.Config{}
-	s.Config.Recommend.CacheSize = 3
-	s.Config.Master.NumJobs = 4
-	s.Config.Recommend.ItemNeighbors.EnableIndex = true
-	s.Config.Recommend.ItemNeighbors.IndexRecall = 1
-	s.Config.Recommend.ItemNeighbors.IndexFitEpoch = 10
+	m.Config = &config.Config{}
+	m.Config.Recommend.CacheSize = 3
+	m.Config.Master.NumJobs = 4
+	m.Config.Recommend.ItemNeighbors.EnableIndex = true
+	m.Config.Recommend.ItemNeighbors.IndexRecall = 1
+	m.Config.Recommend.ItemNeighbors.IndexFitEpoch = 10
+	// collect similar
+	items := []data.Item{
+		{"0", false, []string{"*"}, time.Now(), []string{"a", "b", "c", "d"}, ""},
+		{"1", false, []string{"*"}, time.Now(), []string{}, ""},
+		{"2", false, []string{"*"}, time.Now(), []string{"b", "c", "d"}, ""},
+		{"3", false, nil, time.Now(), []string{}, ""},
+		{"4", false, nil, time.Now(), []string{"b", "c"}, ""},
+		{"5", false, []string{"*"}, time.Now(), []string{}, ""},
+		{"6", false, []string{"*"}, time.Now(), []string{"c"}, ""},
+		{"7", false, []string{"*"}, time.Now(), []string{}, ""},
+		{"8", false, []string{"*"}, time.Now(), []string{"a", "b", "c", "d", "e"}, ""},
+		{"9", false, nil, time.Now(), []string{}, ""},
+	}
+	feedbacks := make([]data.Feedback, 0)
+	for i := 0; i < 10; i++ {
+		for j := 0; j <= i; j++ {
+			if i%2 == 1 {
+				feedbacks = append(feedbacks, data.Feedback{
+					FeedbackKey: data.FeedbackKey{
+						ItemId:       strconv.Itoa(i),
+						UserId:       strconv.Itoa(j),
+						FeedbackType: "FeedbackType",
+					},
+					Timestamp: time.Now(),
+				})
+			}
+		}
+	}
+	var err error
+	err = m.DataClient.BatchInsertItems(ctx, items)
+	assert.NoError(t, err)
+	err = m.DataClient.BatchInsertFeedback(ctx, feedbacks, true, true, true)
+	assert.NoError(t, err)
+
+	// insert hidden item
+	err = m.DataClient.BatchInsertItems(ctx, []data.Item{{
+		ItemId:   "10",
+		Labels:   []string{"a", "b", "c", "d", "e"},
+		IsHidden: true,
+	}})
+	assert.NoError(t, err)
+	for i := 0; i <= 10; i++ {
+		err = m.DataClient.BatchInsertFeedback(ctx, []data.Feedback{{
+			FeedbackKey: data.FeedbackKey{UserId: strconv.Itoa(i), ItemId: "10", FeedbackType: "FeedbackType"},
+		}}, true, true, true)
+		assert.NoError(t, err)
+	}
+
+	// load mock dataset
+	dataset, _, _, _, err := m.LoadDataFromDatabase(m.DataClient, []string{"FeedbackType"}, nil, 0, 0, NewOnlineEvaluator())
+	assert.NoError(t, err)
+	m.rankingTrainSet = dataset
+
+	// similar items (common users)
+	m.Config.Recommend.ItemNeighbors.NeighborType = config.NeighborTypeRelated
+	neighborTask := NewFindItemNeighborsTask(&m.Master)
+	assert.NoError(t, neighborTask.run(nil))
+	similar, err := m.CacheClient.GetSorted(ctx, cache.Key(cache.ItemNeighbors, "9"), 0, 100)
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"7", "5", "3"}, cache.RemoveScores(similar))
+	assert.Equal(t, m.estimateFindItemNeighborsComplexity(dataset), m.taskMonitor.Tasks[TaskFindItemNeighbors].Done)
+	assert.Equal(t, task.StatusComplete, m.taskMonitor.Tasks[TaskFindItemNeighbors].Status)
+	// similar items in category (common users)
+	similar, err = m.CacheClient.GetSorted(ctx, cache.Key(cache.ItemNeighbors, "9", "*"), 0, 100)
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"7", "5", "1"}, cache.RemoveScores(similar))
+
+	// similar items (common labels)
+	err = m.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastModifyItemTime, "8"), time.Now()))
+	assert.NoError(t, err)
+	m.Config.Recommend.ItemNeighbors.NeighborType = config.NeighborTypeSimilar
+	neighborTask = NewFindItemNeighborsTask(&m.Master)
+	assert.NoError(t, neighborTask.run(nil))
+	similar, err = m.CacheClient.GetSorted(ctx, cache.Key(cache.ItemNeighbors, "8"), 0, 100)
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"0", "2", "4"}, cache.RemoveScores(similar))
+	assert.Equal(t, m.estimateFindItemNeighborsComplexity(dataset), m.taskMonitor.Tasks[TaskFindItemNeighbors].Done)
+	assert.Equal(t, task.StatusComplete, m.taskMonitor.Tasks[TaskFindItemNeighbors].Status)
+	// similar items in category (common labels)
+	similar, err = m.CacheClient.GetSorted(ctx, cache.Key(cache.ItemNeighbors, "8", "*"), 0, 100)
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"0", "2", "6"}, cache.RemoveScores(similar))
+
+	// similar items (auto)
+	err = m.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastModifyItemTime, "8"), time.Now()))
+	assert.NoError(t, err)
+	err = m.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastModifyItemTime, "9"), time.Now()))
+	assert.NoError(t, err)
+	m.Config.Recommend.ItemNeighbors.NeighborType = config.NeighborTypeAuto
+	neighborTask = NewFindItemNeighborsTask(&m.Master)
+	assert.NoError(t, neighborTask.run(nil))
+	similar, err = m.CacheClient.GetSorted(ctx, cache.Key(cache.ItemNeighbors, "8"), 0, 100)
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"0", "2", "4"}, cache.RemoveScores(similar))
+	similar, err = m.CacheClient.GetSorted(ctx, cache.Key(cache.ItemNeighbors, "9"), 0, 100)
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"7", "5", "3"}, cache.RemoveScores(similar))
+	assert.Equal(t, m.estimateFindItemNeighborsComplexity(dataset), m.taskMonitor.Tasks[TaskFindItemNeighbors].Done)
+	assert.Equal(t, task.StatusComplete, m.taskMonitor.Tasks[TaskFindItemNeighbors].Status)
+}
+
+func TestMaster_FindItemNeighborsIVF_ZeroIDF(t *testing.T) {
+	// create mock master
+	m := newMockMaster(t)
+	defer m.Close()
+	ctx := context.Background()
+	// create config
+	m.Config = &config.Config{}
+	m.Config.Recommend.CacheSize = 3
+	m.Config.Master.NumJobs = 4
+	m.Config.Recommend.ItemNeighbors.EnableIndex = true
+	m.Config.Recommend.ItemNeighbors.IndexRecall = 1
+	m.Config.Recommend.ItemNeighbors.IndexFitEpoch = 10
 
 	// create dataset
-	err := s.DataClient.BatchInsertItems(ctx, []data.Item{
-		{ItemId: "0", IsHidden: false, Categories: []string{"*"}, Timestamp: time.Now(), Labels: []string{"a", "a"}, Comment: ""},
-		{ItemId: "1", IsHidden: false, Categories: []string{"*"}, Timestamp: time.Now(), Labels: []string{"a", "a"}, Comment: ""},
+	err := m.DataClient.BatchInsertItems(ctx, []data.Item{
+		{"0", false, []string{"*"}, time.Now(), []string{"a", "a"}, ""},
+		{"1", false, []string{"*"}, time.Now(), []string{"a", "a"}, ""},
 	})
-	s.NoError(err)
-	err = s.DataClient.BatchInsertFeedback(ctx, []data.Feedback{
+	assert.NoError(t, err)
+	err = m.DataClient.BatchInsertFeedback(ctx, []data.Feedback{
 		{FeedbackKey: data.FeedbackKey{FeedbackType: "FeedbackType", UserId: "0", ItemId: "0"}},
 		{FeedbackKey: data.FeedbackKey{FeedbackType: "FeedbackType", UserId: "0", ItemId: "1"}},
 	}, true, true, true)
-	s.NoError(err)
-	dataset, _, _, _, err := s.LoadDataFromDatabase(context.Background(), s.DataClient, []string{"FeedbackType"}, nil, 0, 0, NewOnlineEvaluator())
-	s.NoError(err)
-	s.rankingTrainSet = dataset
+	assert.NoError(t, err)
+	dataset, _, _, _, err := m.LoadDataFromDatabase(m.DataClient, []string{"FeedbackType"}, nil, 0, 0, NewOnlineEvaluator())
+	assert.NoError(t, err)
+	m.rankingTrainSet = dataset
 
 	// similar items (common users)
-	s.Config.Recommend.ItemNeighbors.NeighborType = config.NeighborTypeRelated
-	neighborTask := NewFindItemNeighborsTask(&s.Master)
-	s.NoError(neighborTask.run(context.Background(), nil))
-	similar, err := s.CacheClient.SearchDocuments(ctx, cache.ItemNeighbors, "0", []string{""}, 0, 100)
-	s.NoError(err)
-	s.Equal([]string{"1"}, cache.ConvertDocumentsToValues(similar))
+	m.Config.Recommend.ItemNeighbors.NeighborType = config.NeighborTypeRelated
+	neighborTask := NewFindItemNeighborsTask(&m.Master)
+	assert.NoError(t, neighborTask.run(nil))
+	similar, err := m.CacheClient.GetSorted(ctx, cache.Key(cache.ItemNeighbors, "0"), 0, 100)
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"1"}, cache.RemoveScores(similar))
 
 	// similar items (common labels)
-	s.Config.Recommend.ItemNeighbors.NeighborType = config.NeighborTypeSimilar
-	neighborTask = NewFindItemNeighborsTask(&s.Master)
-	s.NoError(neighborTask.run(context.Background(), nil))
-	similar, err = s.CacheClient.SearchDocuments(ctx, cache.ItemNeighbors, "0", []string{""}, 0, 100)
-	s.NoError(err)
-	s.Equal([]string{"1"}, cache.ConvertDocumentsToValues(similar))
+	m.Config.Recommend.ItemNeighbors.NeighborType = config.NeighborTypeSimilar
+	neighborTask = NewFindItemNeighborsTask(&m.Master)
+	assert.NoError(t, neighborTask.run(nil))
+	similar, err = m.CacheClient.GetSorted(ctx, cache.Key(cache.ItemNeighbors, "0"), 0, 100)
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"1"}, cache.RemoveScores(similar))
 }
 
-func (s *MasterTestSuite) TestFindUserNeighborsBruteForce() {
+func TestMaster_FindUserNeighborsBruteForce(t *testing.T) {
+	// create mock master
+	m := newMockMaster(t)
+	defer m.Close()
 	ctx := context.Background()
 	// create config
-	s.Config = &config.Config{}
-	s.Config.Recommend.CacheSize = 3
-	s.Config.Master.NumJobs = 4
+	m.Config = &config.Config{}
+	m.Config.Recommend.CacheSize = 3
+	m.Config.Master.NumJobs = 4
 	// collect similar
 	users := []data.User{
-		{UserId: "0", Labels: []string{"a", "b", "c", "d"}, Subscribe: nil, Comment: ""},
-		{UserId: "1", Labels: []string{}, Subscribe: nil, Comment: ""},
-		{UserId: "2", Labels: []string{"b", "c", "d"}, Subscribe: nil, Comment: ""},
-		{UserId: "3", Labels: []string{}, Subscribe: nil, Comment: ""},
-		{UserId: "4", Labels: []string{"b", "c"}, Subscribe: nil, Comment: ""},
-		{UserId: "5", Labels: []string{}, Subscribe: nil, Comment: ""},
-		{UserId: "6", Labels: []string{"c"}, Subscribe: nil, Comment: ""},
-		{UserId: "7", Labels: []string{}, Subscribe: nil, Comment: ""},
-		{UserId: "8", Labels: []string{"a", "b", "c", "d", "e"}, Subscribe: nil, Comment: ""},
-		{UserId: "9", Labels: []string{}, Subscribe: nil, Comment: ""},
+		{"0", []string{"a", "b", "c", "d"}, nil, ""},
+		{"1", []string{}, nil, ""},
+		{"2", []string{"b", "c", "d"}, nil, ""},
+		{"3", []string{}, nil, ""},
+		{"4", []string{"b", "c"}, nil, ""},
+		{"5", []string{}, nil, ""},
+		{"6", []string{"c"}, nil, ""},
+		{"7", []string{}, nil, ""},
+		{"8", []string{"a", "b", "c", "d", "e"}, nil, ""},
+		{"9", []string{}, nil, ""},
 	}
 	feedbacks := make([]data.Feedback, 0)
 	for i := 0; i < 10; i++ {
@@ -309,69 +334,78 @@ func (s *MasterTestSuite) TestFindUserNeighborsBruteForce() {
 		}
 	}
 	var err error
-	err = s.DataClient.BatchInsertUsers(ctx, users)
-	s.NoError(err)
-	err = s.DataClient.BatchInsertFeedback(ctx, feedbacks, true, true, true)
-	s.NoError(err)
-	dataset, _, _, _, err := s.LoadDataFromDatabase(context.Background(), s.DataClient, []string{"FeedbackType"}, nil, 0, 0, NewOnlineEvaluator())
-	s.NoError(err)
-	s.rankingTrainSet = dataset
+	err = m.DataClient.BatchInsertUsers(ctx, users)
+	assert.NoError(t, err)
+	err = m.DataClient.BatchInsertFeedback(ctx, feedbacks, true, true, true)
+	assert.NoError(t, err)
+	dataset, _, _, _, err := m.LoadDataFromDatabase(m.DataClient, []string{"FeedbackType"}, nil, 0, 0, NewOnlineEvaluator())
+	assert.NoError(t, err)
+	m.rankingTrainSet = dataset
 
 	// similar items (common users)
-	s.Config.Recommend.UserNeighbors.NeighborType = config.NeighborTypeRelated
-	neighborTask := NewFindUserNeighborsTask(&s.Master)
-	s.NoError(neighborTask.run(context.Background(), nil))
-	similar, err := s.CacheClient.SearchDocuments(ctx, cache.UserNeighbors, "9", []string{""}, 0, 100)
-	s.NoError(err)
-	s.Equal([]string{"7", "5", "3"}, cache.ConvertDocumentsToValues(similar))
+	m.Config.Recommend.UserNeighbors.NeighborType = config.NeighborTypeRelated
+	neighborTask := NewFindUserNeighborsTask(&m.Master)
+	assert.NoError(t, neighborTask.run(nil))
+	similar, err := m.CacheClient.GetSorted(ctx, cache.Key(cache.UserNeighbors, "9"), 0, 100)
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"7", "5", "3"}, cache.RemoveScores(similar))
+	assert.Equal(t, m.estimateFindUserNeighborsComplexity(dataset), m.taskMonitor.Tasks[TaskFindUserNeighbors].Done)
+	assert.Equal(t, task.StatusComplete, m.taskMonitor.Tasks[TaskFindUserNeighbors].Status)
 
 	// similar items (common labels)
-	err = s.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastModifyUserTime, "8"), time.Now()))
-	s.NoError(err)
-	s.Config.Recommend.UserNeighbors.NeighborType = config.NeighborTypeSimilar
-	neighborTask = NewFindUserNeighborsTask(&s.Master)
-	s.NoError(neighborTask.run(context.Background(), nil))
-	similar, err = s.CacheClient.SearchDocuments(ctx, cache.UserNeighbors, "8", []string{""}, 0, 100)
-	s.NoError(err)
-	s.Equal([]string{"0", "2", "4"}, cache.ConvertDocumentsToValues(similar))
+	err = m.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastModifyUserTime, "8"), time.Now()))
+	assert.NoError(t, err)
+	m.Config.Recommend.UserNeighbors.NeighborType = config.NeighborTypeSimilar
+	neighborTask = NewFindUserNeighborsTask(&m.Master)
+	assert.NoError(t, neighborTask.run(nil))
+	similar, err = m.CacheClient.GetSorted(ctx, cache.Key(cache.UserNeighbors, "8"), 0, 100)
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"0", "2", "4"}, cache.RemoveScores(similar))
+	assert.Equal(t, m.estimateFindUserNeighborsComplexity(dataset), m.taskMonitor.Tasks[TaskFindUserNeighbors].Done)
+	assert.Equal(t, task.StatusComplete, m.taskMonitor.Tasks[TaskFindUserNeighbors].Status)
 
 	// similar items (auto)
-	err = s.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastModifyUserTime, "8"), time.Now()))
-	s.NoError(err)
-	err = s.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastModifyUserTime, "9"), time.Now()))
-	s.NoError(err)
-	s.Config.Recommend.UserNeighbors.NeighborType = config.NeighborTypeAuto
-	neighborTask = NewFindUserNeighborsTask(&s.Master)
-	s.NoError(neighborTask.run(context.Background(), nil))
-	similar, err = s.CacheClient.SearchDocuments(ctx, cache.UserNeighbors, "8", []string{""}, 0, 100)
-	s.NoError(err)
-	s.Equal([]string{"0", "2", "4"}, cache.ConvertDocumentsToValues(similar))
-	similar, err = s.CacheClient.SearchDocuments(ctx, cache.UserNeighbors, "9", []string{""}, 0, 100)
-	s.NoError(err)
-	s.Equal([]string{"7", "5", "3"}, cache.ConvertDocumentsToValues(similar))
+	err = m.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastModifyUserTime, "8"), time.Now()))
+	assert.NoError(t, err)
+	err = m.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastModifyUserTime, "9"), time.Now()))
+	assert.NoError(t, err)
+	m.Config.Recommend.UserNeighbors.NeighborType = config.NeighborTypeAuto
+	neighborTask = NewFindUserNeighborsTask(&m.Master)
+	assert.NoError(t, neighborTask.run(nil))
+	similar, err = m.CacheClient.GetSorted(ctx, cache.Key(cache.UserNeighbors, "8"), 0, 100)
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"0", "2", "4"}, cache.RemoveScores(similar))
+	similar, err = m.CacheClient.GetSorted(ctx, cache.Key(cache.UserNeighbors, "9"), 0, 100)
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"7", "5", "3"}, cache.RemoveScores(similar))
+	assert.Equal(t, m.estimateFindUserNeighborsComplexity(dataset), m.taskMonitor.Tasks[TaskFindUserNeighbors].Done)
+	assert.Equal(t, task.StatusComplete, m.taskMonitor.Tasks[TaskFindUserNeighbors].Status)
 }
 
-func (s *MasterTestSuite) TestFindUserNeighborsIVF() {
+func TestMaster_FindUserNeighborsIVF(t *testing.T) {
+	// create mock master
+	m := newMockMaster(t)
+	defer m.Close()
 	ctx := context.Background()
 	// create config
-	s.Config = &config.Config{}
-	s.Config.Recommend.CacheSize = 3
-	s.Config.Master.NumJobs = 4
-	s.Config.Recommend.UserNeighbors.EnableIndex = true
-	s.Config.Recommend.UserNeighbors.IndexRecall = 1
-	s.Config.Recommend.UserNeighbors.IndexFitEpoch = 10
+	m.Config = &config.Config{}
+	m.Config.Recommend.CacheSize = 3
+	m.Config.Master.NumJobs = 4
+	m.Config.Recommend.UserNeighbors.EnableIndex = true
+	m.Config.Recommend.UserNeighbors.IndexRecall = 1
+	m.Config.Recommend.UserNeighbors.IndexFitEpoch = 10
 	// collect similar
 	users := []data.User{
-		{UserId: "0", Labels: []string{"a", "b", "c", "d"}, Subscribe: nil, Comment: ""},
-		{UserId: "1", Labels: []string{}, Subscribe: nil, Comment: ""},
-		{UserId: "2", Labels: []string{"b", "c", "d"}, Subscribe: nil, Comment: ""},
-		{UserId: "3", Labels: []string{}, Subscribe: nil, Comment: ""},
-		{UserId: "4", Labels: []string{"b", "c"}, Subscribe: nil, Comment: ""},
-		{UserId: "5", Labels: []string{}, Subscribe: nil, Comment: ""},
-		{UserId: "6", Labels: []string{"c"}, Subscribe: nil, Comment: ""},
-		{UserId: "7", Labels: []string{}, Subscribe: nil, Comment: ""},
-		{UserId: "8", Labels: []string{"a", "b", "c", "d", "e"}, Subscribe: nil, Comment: ""},
-		{UserId: "9", Labels: []string{}, Subscribe: nil, Comment: ""},
+		{"0", []string{"a", "b", "c", "d"}, nil, ""},
+		{"1", []string{}, nil, ""},
+		{"2", []string{"b", "c", "d"}, nil, ""},
+		{"3", []string{}, nil, ""},
+		{"4", []string{"b", "c"}, nil, ""},
+		{"5", []string{}, nil, ""},
+		{"6", []string{"c"}, nil, ""},
+		{"7", []string{}, nil, ""},
+		{"8", []string{"a", "b", "c", "d", "e"}, nil, ""},
+		{"9", []string{}, nil, ""},
 	}
 	feedbacks := make([]data.Feedback, 0)
 	for i := 0; i < 10; i++ {
@@ -389,98 +423,109 @@ func (s *MasterTestSuite) TestFindUserNeighborsIVF() {
 		}
 	}
 	var err error
-	err = s.DataClient.BatchInsertUsers(ctx, users)
-	s.NoError(err)
-	err = s.DataClient.BatchInsertFeedback(ctx, feedbacks, true, true, true)
-	s.NoError(err)
-	dataset, _, _, _, err := s.LoadDataFromDatabase(context.Background(), s.DataClient, []string{"FeedbackType"}, nil, 0, 0, NewOnlineEvaluator())
-	s.NoError(err)
-	s.rankingTrainSet = dataset
+	err = m.DataClient.BatchInsertUsers(ctx, users)
+	assert.NoError(t, err)
+	err = m.DataClient.BatchInsertFeedback(ctx, feedbacks, true, true, true)
+	assert.NoError(t, err)
+	dataset, _, _, _, err := m.LoadDataFromDatabase(m.DataClient, []string{"FeedbackType"}, nil, 0, 0, NewOnlineEvaluator())
+	assert.NoError(t, err)
+	m.rankingTrainSet = dataset
 
 	// similar items (common users)
-	s.Config.Recommend.UserNeighbors.NeighborType = config.NeighborTypeRelated
-	neighborTask := NewFindUserNeighborsTask(&s.Master)
-	s.NoError(neighborTask.run(context.Background(), nil))
-	similar, err := s.CacheClient.SearchDocuments(ctx, cache.UserNeighbors, "9", []string{""}, 0, 100)
-	s.NoError(err)
-	s.Equal([]string{"7", "5", "3"}, cache.ConvertDocumentsToValues(similar))
+	m.Config.Recommend.UserNeighbors.NeighborType = config.NeighborTypeRelated
+	neighborTask := NewFindUserNeighborsTask(&m.Master)
+	assert.NoError(t, neighborTask.run(nil))
+	similar, err := m.CacheClient.GetSorted(ctx, cache.Key(cache.UserNeighbors, "9"), 0, 100)
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"7", "5", "3"}, cache.RemoveScores(similar))
+	assert.Equal(t, m.estimateFindUserNeighborsComplexity(dataset), m.taskMonitor.Tasks[TaskFindUserNeighbors].Done)
+	assert.Equal(t, task.StatusComplete, m.taskMonitor.Tasks[TaskFindUserNeighbors].Status)
 
 	// similar items (common labels)
-	err = s.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastModifyUserTime, "8"), time.Now()))
-	s.NoError(err)
-	s.Config.Recommend.UserNeighbors.NeighborType = config.NeighborTypeSimilar
-	neighborTask = NewFindUserNeighborsTask(&s.Master)
-	s.NoError(neighborTask.run(context.Background(), nil))
-	similar, err = s.CacheClient.SearchDocuments(ctx, cache.UserNeighbors, "8", []string{""}, 0, 100)
-	s.NoError(err)
-	s.Equal([]string{"0", "2", "4"}, cache.ConvertDocumentsToValues(similar))
+	err = m.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastModifyUserTime, "8"), time.Now()))
+	assert.NoError(t, err)
+	m.Config.Recommend.UserNeighbors.NeighborType = config.NeighborTypeSimilar
+	neighborTask = NewFindUserNeighborsTask(&m.Master)
+	assert.NoError(t, neighborTask.run(nil))
+	similar, err = m.CacheClient.GetSorted(ctx, cache.Key(cache.UserNeighbors, "8"), 0, 100)
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"0", "2", "4"}, cache.RemoveScores(similar))
+	assert.Equal(t, m.estimateFindUserNeighborsComplexity(dataset), m.taskMonitor.Tasks[TaskFindUserNeighbors].Done)
+	assert.Equal(t, task.StatusComplete, m.taskMonitor.Tasks[TaskFindUserNeighbors].Status)
 
 	// similar items (auto)
-	err = s.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastModifyUserTime, "8"), time.Now()))
-	s.NoError(err)
-	err = s.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastModifyUserTime, "9"), time.Now()))
-	s.NoError(err)
-	s.Config.Recommend.UserNeighbors.NeighborType = config.NeighborTypeAuto
-	neighborTask = NewFindUserNeighborsTask(&s.Master)
-	s.NoError(neighborTask.run(context.Background(), nil))
-	similar, err = s.CacheClient.SearchDocuments(ctx, cache.UserNeighbors, "8", []string{""}, 0, 100)
-	s.NoError(err)
-	s.Equal([]string{"0", "2", "4"}, cache.ConvertDocumentsToValues(similar))
-	similar, err = s.CacheClient.SearchDocuments(ctx, cache.UserNeighbors, "9", []string{""}, 0, 100)
-	s.NoError(err)
-	s.Equal([]string{"7", "5", "3"}, cache.ConvertDocumentsToValues(similar))
+	err = m.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastModifyUserTime, "8"), time.Now()))
+	assert.NoError(t, err)
+	err = m.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastModifyUserTime, "9"), time.Now()))
+	assert.NoError(t, err)
+	m.Config.Recommend.UserNeighbors.NeighborType = config.NeighborTypeAuto
+	neighborTask = NewFindUserNeighborsTask(&m.Master)
+	assert.NoError(t, neighborTask.run(nil))
+	similar, err = m.CacheClient.GetSorted(ctx, cache.Key(cache.UserNeighbors, "8"), 0, 100)
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"0", "2", "4"}, cache.RemoveScores(similar))
+	similar, err = m.CacheClient.GetSorted(ctx, cache.Key(cache.UserNeighbors, "9"), 0, 100)
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"7", "5", "3"}, cache.RemoveScores(similar))
+	assert.Equal(t, m.estimateFindUserNeighborsComplexity(dataset), m.taskMonitor.Tasks[TaskFindUserNeighbors].Done)
+	assert.Equal(t, task.StatusComplete, m.taskMonitor.Tasks[TaskFindUserNeighbors].Status)
 }
 
-func (s *MasterTestSuite) TestFindUserNeighborsIVF_ZeroIDF() {
+func TestMaster_FindUserNeighborsIVF_ZeroIDF(t *testing.T) {
+	// create mock master
+	m := newMockMaster(t)
+	defer m.Close()
 	ctx := context.Background()
 	// create config
-	s.Config = &config.Config{}
-	s.Config.Recommend.CacheSize = 3
-	s.Config.Master.NumJobs = 4
-	s.Config.Recommend.UserNeighbors.EnableIndex = true
-	s.Config.Recommend.UserNeighbors.IndexRecall = 1
-	s.Config.Recommend.UserNeighbors.IndexFitEpoch = 10
+	m.Config = &config.Config{}
+	m.Config.Recommend.CacheSize = 3
+	m.Config.Master.NumJobs = 4
+	m.Config.Recommend.UserNeighbors.EnableIndex = true
+	m.Config.Recommend.UserNeighbors.IndexRecall = 1
+	m.Config.Recommend.UserNeighbors.IndexFitEpoch = 10
 
 	// create dataset
-	err := s.DataClient.BatchInsertUsers(ctx, []data.User{
-		{UserId: "0", Labels: []string{"a", "a"}, Subscribe: nil, Comment: ""},
-		{UserId: "1", Labels: []string{"a", "a"}, Subscribe: nil, Comment: ""},
+	err := m.DataClient.BatchInsertUsers(ctx, []data.User{
+		{"0", []string{"a", "a"}, nil, ""},
+		{"1", []string{"a", "a"}, nil, ""},
 	})
-	s.NoError(err)
-	err = s.DataClient.BatchInsertFeedback(ctx, []data.Feedback{
+	assert.NoError(t, err)
+	err = m.DataClient.BatchInsertFeedback(ctx, []data.Feedback{
 		{FeedbackKey: data.FeedbackKey{FeedbackType: "FeedbackType", UserId: "0", ItemId: "0"}},
 		{FeedbackKey: data.FeedbackKey{FeedbackType: "FeedbackType", UserId: "1", ItemId: "0"}},
 	}, true, true, true)
-	s.NoError(err)
-	dataset, _, _, _, err := s.LoadDataFromDatabase(context.Background(), s.DataClient, []string{"FeedbackType"}, nil, 0, 0, NewOnlineEvaluator())
-	s.NoError(err)
-	s.rankingTrainSet = dataset
+	assert.NoError(t, err)
+	dataset, _, _, _, err := m.LoadDataFromDatabase(m.DataClient, []string{"FeedbackType"}, nil, 0, 0, NewOnlineEvaluator())
+	assert.NoError(t, err)
+	m.rankingTrainSet = dataset
 
 	// similar users (common items)
-	s.Config.Recommend.UserNeighbors.NeighborType = config.NeighborTypeRelated
-	neighborTask := NewFindUserNeighborsTask(&s.Master)
-	s.NoError(neighborTask.run(context.Background(), nil))
-	similar, err := s.CacheClient.SearchDocuments(ctx, cache.UserNeighbors, "0", []string{""}, 0, 100)
-	s.NoError(err)
-	s.Equal([]string{"1"}, cache.ConvertDocumentsToValues(similar))
+	m.Config.Recommend.UserNeighbors.NeighborType = config.NeighborTypeRelated
+	neighborTask := NewFindUserNeighborsTask(&m.Master)
+	assert.NoError(t, neighborTask.run(nil))
+	similar, err := m.CacheClient.GetSorted(ctx, cache.Key(cache.UserNeighbors, "0"), 0, 100)
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"1"}, cache.RemoveScores(similar))
 
 	// similar users (common labels)
-	s.Config.Recommend.UserNeighbors.NeighborType = config.NeighborTypeSimilar
-	neighborTask = NewFindUserNeighborsTask(&s.Master)
-	s.NoError(neighborTask.run(context.Background(), nil))
-	similar, err = s.CacheClient.SearchDocuments(ctx, cache.UserNeighbors, "0", []string{""}, 0, 100)
-	s.NoError(err)
-	s.Equal([]string{"1"}, cache.ConvertDocumentsToValues(similar))
+	m.Config.Recommend.UserNeighbors.NeighborType = config.NeighborTypeSimilar
+	neighborTask = NewFindUserNeighborsTask(&m.Master)
+	assert.NoError(t, neighborTask.run(nil))
+	similar, err = m.CacheClient.GetSorted(ctx, cache.Key(cache.UserNeighbors, "0"), 0, 100)
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"1"}, cache.RemoveScores(similar))
 }
 
-func (s *MasterTestSuite) TestLoadDataFromDatabase() {
+func TestMaster_LoadDataFromDatabase(t *testing.T) {
+	// create mock master
+	m := newMockMaster(t)
+	defer m.Close()
 	ctx := context.Background()
 	// create config
-	s.Config = &config.Config{}
-	s.Config.Recommend.CacheSize = 3
-	s.Config.Recommend.DataSource.PositiveFeedbackTypes = []string{"positive"}
-	s.Config.Recommend.DataSource.ReadFeedbackTypes = []string{"negative"}
-	s.Config.Master.NumJobs = runtime.NumCPU()
+	m.Config = &config.Config{}
+	m.Config.Recommend.CacheSize = 3
+	m.Config.Recommend.DataSource.PositiveFeedbackTypes = []string{"positive"}
+	m.Config.Recommend.DataSource.ReadFeedbackTypes = []string{"negative"}
 
 	// insert items
 	var items []data.Item
@@ -492,14 +537,14 @@ func (s *MasterTestSuite) TestLoadDataFromDatabase() {
 			Categories: []string{strconv.Itoa(i % 3)},
 		})
 	}
-	err := s.DataClient.BatchInsertItems(ctx, items)
-	s.NoError(err)
-	err = s.DataClient.BatchInsertItems(ctx, []data.Item{{
+	err := m.DataClient.BatchInsertItems(ctx, items)
+	assert.NoError(t, err)
+	err = m.DataClient.BatchInsertItems(ctx, []data.Item{{
 		ItemId:    "9",
 		Timestamp: time.Date(2020, 1, 1, 1, 1, 0, 0, time.UTC),
 		IsHidden:  true,
 	}})
-	s.NoError(err)
+	assert.NoError(t, err)
 
 	// insert users
 	var users []data.User
@@ -509,8 +554,8 @@ func (s *MasterTestSuite) TestLoadDataFromDatabase() {
 			Labels: []string{strconv.Itoa(i % 5), strconv.Itoa(i*10 + 10)},
 		})
 	}
-	err = s.DataClient.BatchInsertUsers(ctx, users)
-	s.NoError(err)
+	err = m.DataClient.BatchInsertUsers(ctx, users)
+	assert.NoError(t, err)
 
 	// insert feedback
 	feedbacks := make([]data.Feedback, 0)
@@ -544,141 +589,277 @@ func (s *MasterTestSuite) TestLoadDataFromDatabase() {
 			})
 		}
 	}
-	err = s.DataClient.BatchInsertFeedback(ctx, feedbacks, false, false, true)
-	s.NoError(err)
+	err = m.DataClient.BatchInsertFeedback(ctx, feedbacks, false, false, true)
+	assert.NoError(t, err)
 
 	// load dataset
-	err = s.runLoadDatasetTask()
-	s.NoError(err)
-	s.Equal(11, s.rankingTrainSet.UserCount())
-	s.Equal(10, s.rankingTrainSet.ItemCount())
-	s.Equal(11, s.rankingTestSet.UserCount())
-	s.Equal(10, s.rankingTestSet.ItemCount())
-	s.Equal(55, s.rankingTrainSet.Count()+s.rankingTestSet.Count())
-	s.Equal(11, s.clickTrainSet.UserCount())
-	s.Equal(10, s.clickTrainSet.ItemCount())
-	s.Equal(11, s.clickTestSet.UserCount())
-	s.Equal(10, s.clickTestSet.ItemCount())
-	s.Equal(int32(3), s.clickTrainSet.Index.CountItemLabels())
-	s.Equal(int32(5), s.clickTrainSet.Index.CountUserLabels())
-	s.Equal(int32(3), s.clickTestSet.Index.CountItemLabels())
-	s.Equal(int32(5), s.clickTestSet.Index.CountUserLabels())
-	s.Equal(90, s.clickTrainSet.Count()+s.clickTestSet.Count())
-	s.Equal(45, s.clickTrainSet.PositiveCount+s.clickTestSet.PositiveCount)
-	s.Equal(45, s.clickTrainSet.NegativeCount+s.clickTestSet.NegativeCount)
+	err = m.runLoadDatasetTask()
+	assert.NoError(t, err)
+	assert.Equal(t, 11, m.rankingTrainSet.UserCount())
+	assert.Equal(t, 10, m.rankingTrainSet.ItemCount())
+	assert.Equal(t, 11, m.rankingTestSet.UserCount())
+	assert.Equal(t, 10, m.rankingTestSet.ItemCount())
+	assert.Equal(t, 55, m.rankingTrainSet.Count()+m.rankingTestSet.Count())
+	assert.Equal(t, 11, m.clickTrainSet.UserCount())
+	assert.Equal(t, 10, m.clickTrainSet.ItemCount())
+	assert.Equal(t, 11, m.clickTestSet.UserCount())
+	assert.Equal(t, 10, m.clickTestSet.ItemCount())
+	assert.Equal(t, int32(3), m.clickTrainSet.Index.CountItemLabels())
+	assert.Equal(t, int32(5), m.clickTrainSet.Index.CountUserLabels())
+	assert.Equal(t, int32(3), m.clickTestSet.Index.CountItemLabels())
+	assert.Equal(t, int32(5), m.clickTestSet.Index.CountUserLabels())
+	assert.Equal(t, 90, m.clickTrainSet.Count()+m.clickTestSet.Count())
+	assert.Equal(t, 45, m.clickTrainSet.PositiveCount+m.clickTestSet.PositiveCount)
+	assert.Equal(t, 45, m.clickTrainSet.NegativeCount+m.clickTestSet.NegativeCount)
 
 	// check latest items
-	latest, err := s.CacheClient.SearchDocuments(ctx, cache.LatestItems, "", []string{""}, 0, 100)
-	s.NoError(err)
-	s.Equal([]cache.Document{
-		{Id: items[8].ItemId, Score: float64(items[8].Timestamp.Unix())},
-		{Id: items[7].ItemId, Score: float64(items[7].Timestamp.Unix())},
-		{Id: items[6].ItemId, Score: float64(items[6].Timestamp.Unix())},
-	}, lo.Map(latest, func(document cache.Document, _ int) cache.Document {
-		return cache.Document{Id: document.Id, Score: document.Score}
-	}))
-	latest, err = s.CacheClient.SearchDocuments(ctx, cache.LatestItems, "", []string{"2"}, 0, 100)
-	s.NoError(err)
-	s.Equal([]cache.Document{
-		{Id: items[8].ItemId, Score: float64(items[8].Timestamp.Unix())},
-		{Id: items[5].ItemId, Score: float64(items[5].Timestamp.Unix())},
-		{Id: items[2].ItemId, Score: float64(items[2].Timestamp.Unix())},
-	}, lo.Map(latest, func(document cache.Document, _ int) cache.Document {
-		return cache.Document{Id: document.Id, Score: document.Score}
-	}))
+	latest, err := m.CacheClient.GetSorted(ctx, cache.Key(cache.LatestItems, ""), 0, 100)
+	assert.NoError(t, err)
+	assert.Equal(t, []cache.Scored{
+		{items[8].ItemId, float64(items[8].Timestamp.Unix())},
+		{items[7].ItemId, float64(items[7].Timestamp.Unix())},
+		{items[6].ItemId, float64(items[6].Timestamp.Unix())},
+	}, latest)
+	latest, err = m.CacheClient.GetSorted(ctx, cache.Key(cache.LatestItems, "2"), 0, 100)
+	assert.NoError(t, err)
+	assert.Equal(t, []cache.Scored{
+		{items[8].ItemId, float64(items[8].Timestamp.Unix())},
+		{items[5].ItemId, float64(items[5].Timestamp.Unix())},
+		{items[2].ItemId, float64(items[2].Timestamp.Unix())},
+	}, latest)
 
 	// check popular items
-	popular, err := s.CacheClient.SearchDocuments(ctx, cache.PopularItems, "", []string{""}, 0, 3)
-	s.NoError(err)
-	s.Equal([]cache.Document{
+	popular, err := m.CacheClient.GetSorted(ctx, cache.Key(cache.PopularItems, ""), 0, 2)
+	assert.NoError(t, err)
+	assert.Equal(t, []cache.Scored{
 		{Id: items[8].ItemId, Score: 9},
 		{Id: items[7].ItemId, Score: 8},
 		{Id: items[6].ItemId, Score: 7},
-	}, lo.Map(popular, func(document cache.Document, _ int) cache.Document {
-		return cache.Document{Id: document.Id, Score: document.Score}
-	}))
-	popular, err = s.CacheClient.SearchDocuments(ctx, cache.PopularItems, "", []string{"2"}, 0, 3)
-	s.NoError(err)
-	s.Equal([]cache.Document{
+	}, popular)
+	popular, err = m.CacheClient.GetSorted(ctx, cache.Key(cache.PopularItems, "2"), 0, 2)
+	assert.NoError(t, err)
+	assert.Equal(t, []cache.Scored{
 		{Id: items[8].ItemId, Score: 9},
 		{Id: items[5].ItemId, Score: 6},
 		{Id: items[2].ItemId, Score: 3},
-	}, lo.Map(popular, func(document cache.Document, _ int) cache.Document {
-		return cache.Document{Id: document.Id, Score: document.Score}
-	}))
+	}, popular)
 
 	// check categories
-	categories, err := s.CacheClient.GetSet(ctx, cache.ItemCategories)
-	s.NoError(err)
-	s.Equal([]string{"0", "1", "2"}, categories)
+	categories, err := m.CacheClient.GetSet(ctx, cache.ItemCategories)
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"0", "1", "2"}, categories)
 }
 
-func (s *MasterTestSuite) TestCheckItemNeighborCacheTimeout() {
-	s.Config = config.GetDefaultConfig()
+func TestCheckItemNeighborCacheTimeout(t *testing.T) {
+	// create mock master
+	m := newMockMaster(t)
+	defer m.Close()
+	m.Config = config.GetDefaultConfig()
 	ctx := context.Background()
 
 	// empty cache
-	s.True(s.checkItemNeighborCacheTimeout("1", nil))
-	err := s.CacheClient.AddDocuments(ctx, cache.ItemNeighbors, "1", []cache.Document{
-		{Id: "2", Score: 1, Categories: []string{""}},
-		{Id: "3", Score: 2, Categories: []string{""}},
-		{Id: "4", Score: 3, Categories: []string{""}},
+	assert.True(t, m.checkItemNeighborCacheTimeout("1", nil))
+	err := m.CacheClient.SetSorted(ctx, cache.Key(cache.ItemNeighbors, "1"), []cache.Scored{
+		{Id: "2", Score: 1},
+		{Id: "3", Score: 2},
+		{Id: "4", Score: 3},
 	})
-	s.NoError(err)
+	assert.NoError(t, err)
 
 	// digest mismatch
-	err = s.CacheClient.Set(ctx, cache.String(cache.Key(cache.ItemNeighborsDigest, "1"), "digest"))
-	s.NoError(err)
-	s.True(s.checkItemNeighborCacheTimeout("1", nil))
+	err = m.CacheClient.Set(ctx, cache.String(cache.Key(cache.ItemNeighborsDigest, "1"), "digest"))
+	assert.NoError(t, err)
+	assert.True(t, m.checkItemNeighborCacheTimeout("1", nil))
 
 	// staled cache
-	err = s.CacheClient.Set(ctx, cache.String(cache.Key(cache.ItemNeighborsDigest, "1"), s.Config.ItemNeighborDigest()))
-	s.NoError(err)
-	s.True(s.checkItemNeighborCacheTimeout("1", nil))
-	err = s.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastModifyItemTime, "1"), time.Now().Add(-time.Minute)))
-	s.NoError(err)
-	s.True(s.checkItemNeighborCacheTimeout("1", nil))
-	err = s.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastUpdateItemNeighborsTime, "1"), time.Now().Add(-time.Hour)))
-	s.NoError(err)
-	s.True(s.checkItemNeighborCacheTimeout("1", nil))
+	err = m.CacheClient.Set(ctx, cache.String(cache.Key(cache.ItemNeighborsDigest, "1"), m.Config.ItemNeighborDigest()))
+	assert.NoError(t, err)
+	assert.True(t, m.checkItemNeighborCacheTimeout("1", nil))
+	err = m.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastModifyItemTime, "1"), time.Now().Add(-time.Minute)))
+	assert.NoError(t, err)
+	assert.True(t, m.checkItemNeighborCacheTimeout("1", nil))
+	err = m.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastUpdateItemNeighborsTime, "1"), time.Now().Add(-time.Hour)))
+	assert.NoError(t, err)
+	assert.True(t, m.checkItemNeighborCacheTimeout("1", nil))
 
 	// not staled cache
-	err = s.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastUpdateItemNeighborsTime, "1"), time.Now()))
-	s.NoError(err)
-	s.False(s.checkItemNeighborCacheTimeout("1", nil))
+	err = m.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastUpdateItemNeighborsTime, "1"), time.Now()))
+	assert.NoError(t, err)
+	assert.False(t, m.checkItemNeighborCacheTimeout("1", nil))
 }
 
-func (s *MasterTestSuite) TestCheckUserNeighborCacheTimeout() {
+func TestCheckUserNeighborCacheTimeout(t *testing.T) {
+	// create mock master
+	m := newMockMaster(t)
+	defer m.Close()
 	ctx := context.Background()
-	s.Config = config.GetDefaultConfig()
+	m.Config = config.GetDefaultConfig()
 
 	// empty cache
-	s.True(s.checkUserNeighborCacheTimeout("1"))
-	err := s.CacheClient.AddDocuments(ctx, cache.UserNeighbors, "1", []cache.Document{
-		{Id: "1", Score: 1, Categories: []string{""}},
-		{Id: "2", Score: 2, Categories: []string{""}},
-		{Id: "3", Score: 3, Categories: []string{""}},
+	assert.True(t, m.checkUserNeighborCacheTimeout("1"))
+	err := m.CacheClient.SetSorted(ctx, cache.Key(cache.UserNeighbors, "1"), []cache.Scored{
+		{Id: "1", Score: 1},
+		{Id: "2", Score: 2},
+		{Id: "3", Score: 3},
 	})
-	s.NoError(err)
+	assert.NoError(t, err)
 
 	// digest mismatch
-	err = s.CacheClient.Set(ctx, cache.String(cache.Key(cache.UserNeighborsDigest, "1"), "digest"))
-	s.NoError(err)
-	s.True(s.checkUserNeighborCacheTimeout("1"))
+	err = m.CacheClient.Set(ctx, cache.String(cache.Key(cache.UserNeighborsDigest, "1"), "digest"))
+	assert.NoError(t, err)
+	assert.True(t, m.checkUserNeighborCacheTimeout("1"))
 
 	// staled cache
-	err = s.CacheClient.Set(ctx, cache.String(cache.Key(cache.UserNeighborsDigest, "1"), s.Config.UserNeighborDigest()))
-	s.NoError(err)
-	s.True(s.checkUserNeighborCacheTimeout("1"))
-	err = s.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastModifyUserTime, "1"), time.Now().Add(-time.Minute)))
-	s.NoError(err)
-	s.True(s.checkUserNeighborCacheTimeout("1"))
-	err = s.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastUpdateUserNeighborsTime, "1"), time.Now().Add(-time.Hour)))
-	s.NoError(err)
-	s.True(s.checkUserNeighborCacheTimeout("1"))
+	err = m.CacheClient.Set(ctx, cache.String(cache.Key(cache.UserNeighborsDigest, "1"), m.Config.UserNeighborDigest()))
+	assert.NoError(t, err)
+	assert.True(t, m.checkUserNeighborCacheTimeout("1"))
+	err = m.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastModifyUserTime, "1"), time.Now().Add(-time.Minute)))
+	assert.NoError(t, err)
+	assert.True(t, m.checkUserNeighborCacheTimeout("1"))
+	err = m.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastUpdateUserNeighborsTime, "1"), time.Now().Add(-time.Hour)))
+	assert.NoError(t, err)
+	assert.True(t, m.checkUserNeighborCacheTimeout("1"))
 
 	// not staled cache
-	err = s.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastUpdateUserNeighborsTime, "1"), time.Now()))
-	s.NoError(err)
-	s.False(s.checkUserNeighborCacheTimeout("1"))
+	err = m.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastUpdateUserNeighborsTime, "1"), time.Now()))
+	assert.NoError(t, err)
+	assert.False(t, m.checkUserNeighborCacheTimeout("1"))
+}
+
+func TestRunCacheGarbageCollectionTask(t *testing.T) {
+	// create mock master
+	m := newMockMaster(t)
+	defer m.Close()
+	m.Config = config.GetDefaultConfig()
+	ctx := context.Background()
+
+	// insert data
+	err := m.DataClient.BatchInsertFeedback(ctx, []data.Feedback{{FeedbackKey: data.FeedbackKey{UserId: "1", ItemId: "10"}}}, true, true, true)
+	assert.NoError(t, err)
+	err = m.runLoadDatasetTask()
+	assert.NoError(t, err)
+
+	// insert cache
+	timestamp := time.Now()
+	err = m.CacheClient.Set(ctx,
+		cache.String(cache.Key(cache.UserNeighborsDigest, "1"), "digest"),
+		cache.String(cache.Key(cache.OfflineRecommendDigest, "1"), "digest"),
+		cache.Time(cache.Key(cache.LastModifyUserTime, "1"), timestamp),
+		cache.Time(cache.Key(cache.LastUpdateUserNeighborsTime, "1"), timestamp),
+		cache.Time(cache.Key(cache.LastUpdateUserRecommendTime, "1"), timestamp),
+	)
+	assert.NoError(t, err)
+	err = m.CacheClient.SetSorted(ctx, cache.Key(cache.UserNeighbors, "1"), []cache.Scored{{Id: "1", Score: 1}})
+	assert.NoError(t, err)
+	err = m.CacheClient.SetSorted(ctx, cache.Key(cache.CollaborativeRecommend, "1"), []cache.Scored{{Id: "1", Score: 1}})
+	assert.NoError(t, err)
+	err = m.CacheClient.SetSorted(ctx, cache.Key(cache.OfflineRecommend, "1"), []cache.Scored{{Id: "1", Score: 1}})
+	assert.NoError(t, err)
+	err = m.CacheClient.Set(ctx,
+		cache.String(cache.Key(cache.ItemNeighborsDigest, "10"), "digest"),
+		cache.Time(cache.Key(cache.LastModifyItemTime, "10"), timestamp),
+		cache.Time(cache.Key(cache.LastUpdateItemNeighborsTime, "10"), timestamp),
+	)
+	assert.NoError(t, err)
+	err = m.CacheClient.SetSorted(ctx, cache.Key(cache.ItemNeighbors, "10"), []cache.Scored{{Id: "1", Score: 1}})
+	assert.NoError(t, err)
+
+	err = m.CacheClient.Set(ctx,
+		cache.String(cache.Key(cache.UserNeighborsDigest, "2"), "digest"),
+		cache.String(cache.Key(cache.OfflineRecommendDigest, "2"), "digest"),
+		cache.Time(cache.Key(cache.LastModifyUserTime, "2"), timestamp),
+		cache.Time(cache.Key(cache.LastUpdateUserNeighborsTime, "2"), timestamp),
+		cache.Time(cache.Key(cache.LastUpdateUserRecommendTime, "2"), timestamp),
+	)
+	assert.NoError(t, err)
+	err = m.CacheClient.SetSorted(ctx, cache.Key(cache.UserNeighbors, "2"), []cache.Scored{{Id: "1", Score: 1}})
+	assert.NoError(t, err)
+	err = m.CacheClient.SetSorted(ctx, cache.Key(cache.CollaborativeRecommend, "2"), []cache.Scored{{Id: "1", Score: 1}})
+	assert.NoError(t, err)
+	err = m.CacheClient.SetSorted(ctx, cache.Key(cache.OfflineRecommend, "2"), []cache.Scored{{Id: "1", Score: 1}})
+	assert.NoError(t, err)
+	err = m.CacheClient.Set(ctx,
+		cache.String(cache.Key(cache.ItemNeighborsDigest, "20"), "digest"),
+		cache.Time(cache.Key(cache.LastModifyItemTime, "20"), timestamp),
+		cache.Time(cache.Key(cache.LastUpdateItemNeighborsTime, "20"), timestamp),
+	)
+	assert.NoError(t, err)
+	err = m.CacheClient.SetSorted(ctx, cache.Key(cache.ItemNeighbors, "20"), []cache.Scored{{Id: "2", Score: 1}})
+	assert.NoError(t, err)
+
+	// remove cache
+	assert.NotNil(t, m.rankingTrainSet)
+	gcTask := NewCacheGarbageCollectionTask(&m.Master)
+	err = gcTask.run(nil)
+	assert.NoError(t, err)
+
+	var s string
+	s, err = m.CacheClient.Get(ctx, cache.Key(cache.UserNeighborsDigest, "1")).String()
+	assert.NoError(t, err)
+	assert.Equal(t, "digest", s)
+	s, err = m.CacheClient.Get(ctx, cache.Key(cache.OfflineRecommendDigest, "1")).String()
+	assert.NoError(t, err)
+	assert.Equal(t, "digest", s)
+	var ts time.Time
+	ts, err = m.CacheClient.Get(ctx, cache.Key(cache.LastModifyUserTime, "1")).Time()
+	assert.NoError(t, err)
+	assert.Equal(t, timestamp.Truncate(time.Second), ts.Truncate(time.Second))
+	ts, err = m.CacheClient.Get(ctx, cache.Key(cache.LastUpdateUserNeighborsTime, "1")).Time()
+	assert.NoError(t, err)
+	assert.Equal(t, timestamp.Truncate(time.Second), ts.Truncate(time.Second))
+	ts, err = m.CacheClient.Get(ctx, cache.Key(cache.LastUpdateUserRecommendTime, "1")).Time()
+	assert.NoError(t, err)
+	assert.Equal(t, timestamp.Truncate(time.Second), ts.Truncate(time.Second))
+	sorted, err := m.CacheClient.GetSorted(ctx, cache.Key(cache.UserNeighbors, "1"), 0, -1)
+	assert.NoError(t, err)
+	assert.Equal(t, []cache.Scored{{Id: "1", Score: 1}}, sorted)
+	sorted, err = m.CacheClient.GetSorted(ctx, cache.Key(cache.CollaborativeRecommend, "1"), 0, -1)
+	assert.NoError(t, err)
+	assert.Equal(t, []cache.Scored{{Id: "1", Score: 1}}, sorted)
+	sorted, err = m.CacheClient.GetSorted(ctx, cache.Key(cache.OfflineRecommend, "1"), 0, -1)
+	assert.NoError(t, err)
+	assert.Equal(t, []cache.Scored{{Id: "1", Score: 1}}, sorted)
+
+	s, err = m.CacheClient.Get(ctx, cache.Key(cache.ItemNeighborsDigest, "10")).String()
+	assert.NoError(t, err)
+	assert.Equal(t, "digest", s)
+	ts, err = m.CacheClient.Get(ctx, cache.Key(cache.LastModifyItemTime, "10")).Time()
+	assert.NoError(t, err)
+	assert.Equal(t, timestamp.Truncate(time.Second), ts.Truncate(time.Second))
+	ts, err = m.CacheClient.Get(ctx, cache.Key(cache.LastUpdateItemNeighborsTime, "10")).Time()
+	assert.NoError(t, err)
+	assert.Equal(t, timestamp.Truncate(time.Second), ts.Truncate(time.Second))
+	sorted, err = m.CacheClient.GetSorted(ctx, cache.Key(cache.ItemNeighbors, "10"), 0, -1)
+	assert.NoError(t, err)
+	assert.Equal(t, []cache.Scored{{Id: "1", Score: 1}}, sorted)
+
+	_, err = m.CacheClient.Get(ctx, cache.Key(cache.UserNeighborsDigest, "2")).String()
+	assert.True(t, errors.Is(err, errors.NotFound))
+	_, err = m.CacheClient.Get(ctx, cache.Key(cache.OfflineRecommendDigest, "2")).String()
+	assert.True(t, errors.Is(err, errors.NotFound))
+	_, err = m.CacheClient.Get(ctx, cache.Key(cache.LastModifyUserTime, "2")).Time()
+	assert.True(t, errors.Is(err, errors.NotFound))
+	_, err = m.CacheClient.Get(ctx, cache.Key(cache.LastUpdateUserNeighborsTime, "2")).Time()
+	assert.True(t, errors.Is(err, errors.NotFound))
+	_, err = m.CacheClient.Get(ctx, cache.Key(cache.LastUpdateUserRecommendTime, "2")).Time()
+	assert.True(t, errors.Is(err, errors.NotFound))
+	sorted, err = m.CacheClient.GetSorted(ctx, cache.Key(cache.UserNeighbors, "2"), 0, -1)
+	assert.NoError(t, err)
+	assert.Empty(t, sorted)
+	sorted, err = m.CacheClient.GetSorted(ctx, cache.Key(cache.CollaborativeRecommend, "2"), 0, -1)
+	assert.NoError(t, err)
+	assert.Empty(t, sorted)
+	sorted, err = m.CacheClient.GetSorted(ctx, cache.Key(cache.OfflineRecommend, "2"), 0, -1)
+	assert.NoError(t, err)
+	assert.Empty(t, sorted)
+
+	_, err = m.CacheClient.Get(ctx, cache.Key(cache.ItemNeighborsDigest, "20")).String()
+	assert.True(t, errors.Is(err, errors.NotFound))
+	_, err = m.CacheClient.Get(ctx, cache.Key(cache.LastModifyItemTime, "20")).Time()
+	assert.True(t, errors.Is(err, errors.NotFound))
+	_, err = m.CacheClient.Get(ctx, cache.Key(cache.LastUpdateItemNeighborsTime, "20")).Time()
+	assert.True(t, errors.Is(err, errors.NotFound))
+	sorted, err = m.CacheClient.GetSorted(ctx, cache.Key(cache.ItemNeighbors, "20"), 0, -1)
+	assert.NoError(t, err)
+	assert.Empty(t, sorted)
 }

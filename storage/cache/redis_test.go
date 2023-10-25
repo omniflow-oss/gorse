@@ -15,17 +15,12 @@
 package cache
 
 import (
-	"context"
-	"fmt"
-	"math"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
-	"github.com/zhenghaoz/gorse/base/log"
-	"google.golang.org/protobuf/proto"
 )
 
 var (
@@ -51,66 +46,32 @@ func (suite *RedisTestSuite) SetupSuite() {
 	var err error
 	suite.Database, err = Open(redisDSN, "gorse_")
 	suite.NoError(err)
-	// flush db
-	err = suite.Database.(*Redis).client.FlushDB(context.TODO()).Err()
-	suite.NoError(err)
-	// create schema
-	err = suite.Database.Init()
-	suite.NoError(err)
-}
-
-func (suite *RedisTestSuite) TestEscapeCharacters() {
-	ts := time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC)
-	ctx := context.Background()
-	for _, c := range []string{"-", ":", ".", "/"} {
-		suite.Run(c, func() {
-			collection := fmt.Sprintf("a%s1", c)
-			subset := fmt.Sprintf("b%s2", c)
-			id := fmt.Sprintf("c%s3", c)
-			err := suite.AddDocuments(ctx, collection, subset, []Document{{
-				Id:         id,
-				Score:      math.MaxFloat64,
-				Categories: []string{"a", "b"},
-				Timestamp:  ts,
-			}})
-			suite.NoError(err)
-			documents, err := suite.SearchDocuments(ctx, collection, subset, []string{"b"}, 0, -1)
-			suite.NoError(err)
-			suite.Equal([]Document{{Id: id, Score: math.MaxFloat64, Categories: []string{"a", "b"}, Timestamp: ts}}, documents)
-
-			err = suite.UpdateDocuments(ctx, []string{collection}, id, DocumentPatch{Score: proto.Float64(1)})
-			suite.NoError(err)
-			documents, err = suite.SearchDocuments(ctx, collection, subset, []string{"b"}, 0, -1)
-			suite.NoError(err)
-			suite.Equal([]Document{{Id: id, Score: 1, Categories: []string{"a", "b"}, Timestamp: ts}}, documents)
-
-			err = suite.DeleteDocuments(ctx, []string{collection}, DocumentCondition{
-				Subset: proto.String(subset),
-				Id:     proto.String(id),
-			})
-			suite.NoError(err)
-			documents, err = suite.SearchDocuments(ctx, collection, subset, []string{"b"}, 0, -1)
-			suite.NoError(err)
-			suite.Empty(documents)
-		})
-	}
 }
 
 func TestRedis(t *testing.T) {
 	suite.Run(t, new(RedisTestSuite))
 }
 
-func BenchmarkRedis(b *testing.B) {
-	log.CloseLogger()
-	// open db
-	database, err := Open(redisDSN, "gorse_")
-	assert.NoError(b, err)
-	// flush db
-	err = database.(*Redis).client.FlushDB(context.TODO()).Err()
-	assert.NoError(b, err)
-	// create schema
-	err = database.Init()
-	assert.NoError(b, err)
-	// benchmark
-	benchmark(b, database)
+func TestParseRedisClusterURL(t *testing.T) {
+	options, err := ParseRedisClusterURL("redis+cluster://username:password@127.0.0.1:6379,127.0.0.1:6380,127.0.0.1:6381/?" +
+		"max_retries=1000&dial_timeout=1h&pool_fifo=true")
+	if assert.NoError(t, err) {
+		assert.Equal(t, "username", options.Username)
+		assert.Equal(t, "password", options.Password)
+		assert.Equal(t, []string{"127.0.0.1:6379", "127.0.0.1:6380", "127.0.0.1:6381"}, options.Addrs)
+		assert.Equal(t, 1000, options.MaxRetries)
+		assert.Equal(t, time.Hour, options.DialTimeout)
+		assert.True(t, options.PoolFIFO)
+	}
+
+	_, err = ParseRedisClusterURL("redis://")
+	assert.Error(t, err)
+	_, err = ParseRedisClusterURL("redis+cluster://username:password@127.0.0.1:6379/?max_retries=a")
+	assert.Error(t, err)
+	_, err = ParseRedisClusterURL("redis+cluster://username:password@127.0.0.1:6379/?dial_timeout=a")
+	assert.Error(t, err)
+	_, err = ParseRedisClusterURL("redis+cluster://username:password@127.0.0.1:6379/?pool_fifo=a")
+	assert.Error(t, err)
+	_, err = ParseRedisClusterURL("redis+cluster://username:password@127.0.0.1:6379/?a=1")
+	assert.Error(t, err)
 }

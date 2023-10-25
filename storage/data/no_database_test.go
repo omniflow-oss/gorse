@@ -16,11 +16,10 @@ package data
 
 import (
 	"context"
-	"testing"
-	"time"
-
 	"github.com/samber/lo"
 	"github.com/stretchr/testify/assert"
+	"testing"
+	"time"
 )
 
 func TestNoDatabase(t *testing.T) {
@@ -28,6 +27,8 @@ func TestNoDatabase(t *testing.T) {
 	var database NoDatabase
 
 	err := database.Close()
+	assert.ErrorIs(t, err, ErrNoDatabase)
+	err = database.Optimize()
 	assert.ErrorIs(t, err, ErrNoDatabase)
 	err = database.Init()
 	assert.ErrorIs(t, err, ErrNoDatabase)
@@ -78,6 +79,6 @@ func TestNoDatabase(t *testing.T) {
 	assert.ErrorIs(t, err, ErrNoDatabase)
 	_, err = database.DeleteUserItemFeedback(ctx, "", "")
 	assert.ErrorIs(t, err, ErrNoDatabase)
-	_, c = database.GetFeedbackStream(ctx, 0)
+	_, c = database.GetFeedbackStream(ctx, 0, nil, lo.ToPtr(time.Now()))
 	assert.ErrorIs(t, <-c, ErrNoDatabase)
 }

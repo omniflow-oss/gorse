@@ -1,4 +1,4 @@
-// Copyright 2023 gorse Project Authors
+// Copyright 2022 gorse Project Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,23 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package progress
+package json
 
-import (
-	"testing"
+import "encoding/json"
 
-	"github.com/stretchr/testify/suite"
-)
-
-type ProgressTestSuite struct {
-	suite.Suite
-	tracer Tracer
+// Marshal returns the JSON encoding of v.
+func Marshal(v interface{}) ([]byte, error) {
+	return json.Marshal(v)
 }
 
-func (suite *ProgressTestSuite) SetupTest() {
-	suite.tracer = Tracer{}
-}
-
-func TestProgressTestSuite(t *testing.T) {
-	suite.Run(t, new(ProgressTestSuite))
+// Unmarshal parses the JSON-encoded data and stores the result
+// in the value pointed to by v. If data is empty, Unmarshal clears
+// contents in v.
+func Unmarshal(data []byte, v interface{}) error {
+	if len(data) == 0 {
+		data = []byte("null")
+	}
+	return json.Unmarshal(data, v)
 }

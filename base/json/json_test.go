@@ -1,4 +1,4 @@
-// Copyright 2020 gorse Project Authors
+// Copyright 2022 gorse Project Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,21 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package parallel
+package json
 
-type Future struct {
-	done chan struct{}
+import (
+	"github.com/stretchr/testify/assert"
+	"testing"
+)
+
+func TestUnmarshal(t *testing.T) {
+	var a []int
+	err := Unmarshal([]byte("[1,2,3]"), &a)
+	assert.NoError(t, err)
+	assert.Equal(t, []int{1, 2, 3}, a)
+
+	err = Unmarshal([]byte(""), &a)
+	assert.NoError(t, err)
+	assert.Empty(t, a)
 }
 
-func Async(f func()) *Future {
-	future := &Future{done: make(chan struct{})}
-	go func() {
-		f()
-		close(future.done)
-	}()
-	return future
-}
-
-func (f *Future) Wait() {
-	<-f.done
+func TestMarshal(t *testing.T) {
+	data, err := Marshal(nil)
+	assert.NoError(t, err)
+	assert.Equal(t, "null", string(data))
 }

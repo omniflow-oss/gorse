@@ -105,16 +105,16 @@ func parseAssembly(path string) (map[string][]Line, error) {
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := scanner.Text()
-		if attributeLine.MatchString(line) {
+		if attributeLine.Match([]byte(line)) {
 			continue
-		} else if nameLine.MatchString(line) {
+		} else if nameLine.Match([]byte(line)) {
 			functionName = strings.Split(line, ":")[0]
 			functions[functionName] = make([]Line, 0)
-		} else if labelLine.MatchString(line) {
+		} else if labelLine.Match([]byte(line)) {
 			labelName = strings.Split(line, ":")[0]
 			labelName = labelName[1:]
 			functions[functionName] = append(functions[functionName], Line{Label: labelName})
-		} else if codeLine.MatchString(line) {
+		} else if codeLine.Match([]byte(line)) {
 			asm := strings.Split(line, "#")[0]
 			asm = strings.TrimSpace(asm)
 			if labelName == "" {
@@ -140,11 +140,11 @@ func parseObjectDump(dump string, functions map[string][]Line) error {
 	)
 	for i, line := range strings.Split(dump, "\n") {
 		line = strings.TrimSpace(line)
-		if symbolLine.MatchString(line) {
+		if symbolLine.Match([]byte(line)) {
 			functionName = strings.Split(line, "<")[1]
 			functionName = strings.Split(functionName, ">")[0]
 			lineNumber = 0
-		} else if dataLine.MatchString(line) {
+		} else if dataLine.Match([]byte(line)) {
 			data := strings.Split(line, ":")[1]
 			data = strings.TrimSpace(data)
 			splits := strings.Split(data, " ")

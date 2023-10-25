@@ -19,16 +19,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"math/rand"
-	"net"
-	"net/http"
-	"os"
-	"runtime"
-	"strconv"
-	"strings"
-	"testing"
-	"time"
-
 	"github.com/emicklei/go-restful/v3"
 	"github.com/go-redis/redis/v9"
 	"github.com/go-resty/resty/v2"
@@ -41,6 +31,15 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"google.golang.org/protobuf/proto"
+	"math/rand"
+	"net"
+	"net/http"
+	"os"
+	"runtime"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
 )
 
 const (
@@ -61,7 +60,7 @@ func init() {
 		}
 		return defaultValue
 	}
-	benchDataStore = env("BENCH_DATA_STORE", "mysql://root:password@tcp(127.0.0.1:3306)/")
+	benchDataStore = env("BENCH_DATA_STORE", "clickhouse://127.0.0.1:8123/")
 	benchCacheStore = env("BENCH_CACHE_STORE", "redis://127.0.0.1:6379/")
 }
 
@@ -86,7 +85,6 @@ func newBenchServer(b *testing.B) *benchServer {
 
 	// configuration
 	s := &benchServer{}
-	s.Settings = &config.Settings{}
 	s.Config = config.GetDefaultConfig()
 	s.DisableLog = true
 	s.WebService = new(restful.WebService)
@@ -192,6 +190,17 @@ func (s *benchServer) prepareData(b *testing.B, url, benchName string) string {
 		err = db.Close()
 		require.NoError(b, err)
 		return url + strings.ToLower(dbName) + "?sslmode=disable&TimeZone=UTC"
+	} else if strings.HasPrefix(url, "clickhouse://") {
+		uri := "http://" + url[len("clickhouse://"):]
+		db, err := sql.Open("clickhouse", uri)
+		require.NoError(b, err)
+		_, err = db.Exec("DROP DATABASE IF EXISTS " + dbName)
+		require.NoError(b, err)
+		_, err = db.Exec("CREATE DATABASE " + dbName)
+		require.NoError(b, err)
+		err = db.Close()
+		require.NoError(b, err)
+		return url + dbName + "?mutations_sync=2"
 	} else if strings.HasPrefix(url, "mongodb://") {
 		ctx := context.Background()
 		cli, err := mongo.Connect(ctx, options.Client().ApplyURI(url+"?authSource=admin&connect=direct"))
@@ -268,8 +277,8 @@ func BenchmarkInsertUser(b *testing.B) {
 			SetBody(&data.User{
 				UserId: fmt.Sprintf("user_%d", i),
 				Labels: []string{
-					fmt.Sprintf("label_%d", i*2+0),
-					fmt.Sprintf("label_%d", i*2+1),
+					fmt.Sprintf("label_%d", i),
+					fmt.Sprintf("label_%d", i*2),
 				},
 				Comment: fmt.Sprintf("comment_%d", i),
 			}).
@@ -292,8 +301,8 @@ func BenchmarkPatchUser(b *testing.B) {
 		r, err := client.R().
 			SetBody(&data.UserPatch{
 				Labels: []string{
-					fmt.Sprintf("label_%d_%d", userIndex*2+0, times),
-					fmt.Sprintf("label_%d_%d", userIndex*2+1, times),
+					fmt.Sprintf("label_%d_%d", userIndex, times),
+					fmt.Sprintf("label_%d_%d", userIndex*2, times),
 				},
 				Comment: proto.String(fmt.Sprintf("comment_%d_%d", userIndex, times)),
 			}).
@@ -342,8 +351,8 @@ func BenchmarkInsertUsers(b *testing.B) {
 					users[i][j] = data.User{
 						UserId: fmt.Sprintf("batch_%d_user_%d", i, j),
 						Labels: []string{
-							fmt.Sprintf("label_%s_0", userId),
-							fmt.Sprintf("label_%s_1", userId),
+							fmt.Sprintf("label_%s", userId),
+							fmt.Sprintf("label_%s", userId),
 						},
 						Comment: fmt.Sprintf("comment_%s", userId),
 					}
@@ -417,12 +426,12 @@ func BenchmarkInsertItem(b *testing.B) {
 			SetBody(&data.Item{
 				ItemId: fmt.Sprintf("item_%v", i),
 				Labels: []string{
-					fmt.Sprintf("label_%d", i*2+0),
-					fmt.Sprintf("label_%d", i*2+1),
+					fmt.Sprintf("label_%d", i),
+					fmt.Sprintf("label_%d", i*2),
 				},
 				Categories: []string{
-					fmt.Sprintf("category_%d", i*2+0),
-					fmt.Sprintf("category_%d", i*2+1),
+					fmt.Sprintf("category_%d", i),
+					fmt.Sprintf("category_%d", i*2),
 				},
 				IsHidden:  i%2 == 0,
 				Timestamp: time.Now(),
@@ -452,13 +461,13 @@ func BenchmarkPatchItem(b *testing.B) {
 		r, err := client.R().
 			SetBody(&data.ItemPatch{
 				Labels: []string{
-					fmt.Sprintf("label_%d_%d", itemIndex*2+0, times),
-					fmt.Sprintf("label_%d_%d", itemIndex*2+1, times),
+					fmt.Sprintf("label%d_%d", itemIndex, times),
+					fmt.Sprintf("label%d_%d", itemIndex, times),
 				},
 				Comment: proto.String(fmt.Sprintf("modified_comment_%d", i)),
 				Categories: []string{
-					fmt.Sprintf("category_%d_%d", i*2+0, times),
-					fmt.Sprintf("category_%d_%d", i*2+1, times),
+					fmt.Sprintf("category%d_%d", i, times),
+					fmt.Sprintf("category%d_%d", i, times),
 				},
 				IsHidden:  &isHidden,
 				Timestamp: &now,
@@ -509,8 +518,8 @@ func BenchmarkInsertItems(b *testing.B) {
 					items = append(items, data.Item{
 						ItemId: itemId,
 						Labels: []string{
-							fmt.Sprintf("label_%d", j*2+0),
-							fmt.Sprintf("label_%d", j*2+1),
+							fmt.Sprintf("label_%d", j),
+							fmt.Sprintf("label_%d", j*2),
 						},
 						Comment: fmt.Sprintf("comment_%d", j),
 					})
@@ -787,16 +796,23 @@ func BenchmarkGetRecommendCache(b *testing.B) {
 	ctx := context.Background()
 	for batchSize := 10; batchSize <= 1000; batchSize *= 10 {
 		b.Run(strconv.Itoa(batchSize), func(b *testing.B) {
-			documents := make([]cache.Document, batchSize)
-			for i := range documents {
-				documents[i].Id = strconv.Itoa(i)
-				documents[i].Score = float64(i)
-				documents[i].Categories = []string{""}
+			scores := make([]cache.Scored, batchSize*2)
+			expects := make([]cache.Scored, batchSize)
+			for i := range scores {
+				scores[i].Id = strconv.Itoa(i)
+				scores[i].Score = float64(i)
+				if i%2 == 0 {
+					expects[i/2] = scores[i]
+				} else {
+					err := NewCacheModification(s.CacheClient, s.HiddenItemsManager).HideItem(strconv.Itoa(i)).Exec()
+					require.NoError(b, err)
+				}
 			}
-			lo.Reverse(documents)
-			err := s.CacheClient.AddDocuments(ctx, cache.PopularItems, "", documents)
+			lo.Reverse(scores)
+			lo.Reverse(expects)
+			err := s.CacheClient.SetSorted(ctx, cache.PopularItems, scores)
 			require.NoError(b, err)
-			s.Config.Recommend.CacheSize = len(documents)
+			s.Config.Recommend.CacheSize = len(scores)
 
 			response := make([]*resty.Response, b.N)
 			client := resty.New()
@@ -809,9 +825,10 @@ func BenchmarkGetRecommendCache(b *testing.B) {
 
 			for _, r := range response {
 				require.Equal(b, http.StatusOK, r.StatusCode(), r.String())
-				expected, err := json.Marshal(documents[:batchSize])
+				var ret []cache.Scored
+				err = json.Unmarshal(r.Body(), &ret)
 				require.NoError(b, err)
-				require.JSONEq(b, string(expected), r.String())
+				require.Equal(b, expects[:batchSize], ret)
 			}
 		})
 	}
@@ -825,28 +842,23 @@ func BenchmarkRecommendFromOfflineCache(b *testing.B) {
 	ctx := context.Background()
 	for batchSize := 10; batchSize <= 1000; batchSize *= 10 {
 		b.Run(strconv.Itoa(batchSize), func(b *testing.B) {
-			documents := make([]cache.Document, batchSize*2)
+			scores := make([]cache.Scored, batchSize*2)
 			expects := make([]string, batchSize)
-			feedbacks := make([]data.Feedback, batchSize)
-			for i := range documents {
-				documents[i].Id = strconv.Itoa(i)
-				documents[i].Score = float64(i)
-				documents[i].Categories = []string{""}
+			for i := range scores {
+				scores[i].Id = strconv.Itoa(i)
+				scores[i].Score = float64(i)
 				if i%2 == 0 {
-					expects[i/2] = documents[i].Id
+					expects[i/2] = scores[i].Id
 				} else {
-					feedbacks[i/2].FeedbackType = "read"
-					feedbacks[i/2].UserId = "init_user_1"
-					feedbacks[i/2].ItemId = documents[i].Id
+					err := s.CacheClient.AddSorted(ctx, cache.Sorted(cache.Key(cache.IgnoreItems, "init_user_1"), []cache.Scored{{scores[i].Id, 0}}))
+					require.NoError(b, err)
 				}
 			}
-			lo.Reverse(documents)
+			lo.Reverse(scores)
 			lo.Reverse(expects)
-			err := s.CacheClient.AddDocuments(ctx, cache.OfflineRecommend, "init_user_1", documents)
+			err := s.CacheClient.SetSorted(ctx, cache.Key(cache.OfflineRecommend, "init_user_1"), scores)
 			require.NoError(b, err)
-			err = s.DataClient.BatchInsertFeedback(ctx, feedbacks, true, true, true)
-			require.NoError(b, err)
-			s.Config.Recommend.CacheSize = len(documents)
+			s.Config.Recommend.CacheSize = len(scores)
 
 			response := make([]*resty.Response, b.N)
 			client := resty.New()
@@ -876,28 +888,29 @@ func BenchmarkRecommendFromLatest(b *testing.B) {
 
 	for batchSize := 10; batchSize <= 1000; batchSize *= 10 {
 		b.Run(strconv.Itoa(batchSize), func(b *testing.B) {
-			documents := make([]cache.Document, batchSize*2)
+			scores := make([]cache.Scored, batchSize*2)
 			expects := make([]string, batchSize)
-			feedbacks := make([]data.Feedback, batchSize)
-			for i := range documents {
-				documents[i].Id = strconv.Itoa(i)
-				documents[i].Score = float64(i)
-				documents[i].Categories = []string{""}
+			for i := range scores {
+				scores[i].Id = strconv.Itoa(i)
+				scores[i].Score = float64(i)
 				if i%2 == 0 {
-					expects[i/2] = documents[i].Id
+					expects[i/2] = scores[i].Id
 				} else {
-					feedbacks[i/2].FeedbackType = "feedback_type"
-					feedbacks[i/2].UserId = "init_user_1"
-					feedbacks[i/2].ItemId = documents[i].Id
+					err := s.DataClient.BatchInsertFeedback(ctx, []data.Feedback{{
+						FeedbackKey: data.FeedbackKey{
+							FeedbackType: "feedback_type",
+							UserId:       "init_user_1",
+							ItemId:       scores[i].Id,
+						},
+					}}, true, true, true)
+					require.NoError(b, err)
 				}
 			}
-			lo.Reverse(documents)
+			lo.Reverse(scores)
 			lo.Reverse(expects)
-			err := s.CacheClient.AddDocuments(ctx, cache.LatestItems, "", documents)
+			err := s.CacheClient.SetSorted(ctx, cache.LatestItems, scores)
 			require.NoError(b, err)
-			err = s.DataClient.BatchInsertFeedback(ctx, feedbacks, true, true, true)
-			require.NoError(b, err)
-			s.Config.Recommend.CacheSize = len(documents)
+			s.Config.Recommend.CacheSize = len(scores)
 
 			response := make([]*resty.Response, b.N)
 			client := resty.New()
@@ -928,11 +941,10 @@ func BenchmarkRecommendFromItemBased(b *testing.B) {
 	for batchSize := 10; batchSize <= 1000; batchSize *= 10 {
 		b.Run(strconv.Itoa(batchSize), func(b *testing.B) {
 			// insert user feedbacks
-			documents := make([]cache.Document, batchSize*2)
-			for i := range documents {
-				documents[i].Id = fmt.Sprintf("init_item_%d", i)
-				documents[i].Score = float64(i)
-				documents[i].Categories = []string{""}
+			scores := make([]cache.Scored, batchSize*2)
+			for i := range scores {
+				scores[i].Id = fmt.Sprintf("init_item_%d", i)
+				scores[i].Score = float64(i)
 				if i < s.Config.Recommend.Online.NumFeedbackFallbackItemBased {
 					err := s.DataClient.BatchInsertFeedback(ctx, []data.Feedback{{
 						FeedbackKey: data.FeedbackKey{
@@ -948,11 +960,11 @@ func BenchmarkRecommendFromItemBased(b *testing.B) {
 
 			// insert user neighbors
 			for i := 0; i < s.Config.Recommend.Online.NumFeedbackFallbackItemBased; i++ {
-				err := s.CacheClient.AddDocuments(ctx, cache.ItemNeighbors, fmt.Sprintf("init_item_%d", i), documents)
+				err := s.CacheClient.SetSorted(ctx, cache.Key(cache.ItemNeighbors, fmt.Sprintf("init_item_%d", i)), scores)
 				require.NoError(b, err)
 			}
 
-			s.Config.Recommend.CacheSize = len(documents)
+			s.Config.Recommend.CacheSize = len(scores)
 			s.Config.Recommend.DataSource.PositiveFeedbackTypes = []string{"feedback_type_positive"}
 			s.Config.Recommend.Online.FallbackRecommend = []string{"item_based"}
 

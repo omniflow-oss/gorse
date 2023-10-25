@@ -14,9 +14,8 @@
 package model
 
 import (
-	"testing"
-
 	"github.com/stretchr/testify/assert"
+	"testing"
 )
 
 func TestParams_Copy(t *testing.T) {
@@ -105,18 +104,6 @@ func TestParams_GetString(t *testing.T) {
 	// Normal case
 	p[Similarity] = "abc"
 	assert.Equal(t, "abc", p.GetString(Similarity, "abc"))
-}
-
-func TestParams_GetIntSlice(t *testing.T) {
-	p := Params{}
-	// Empty case
-	assert.Equal(t, []int{1, 2, 3}, p.GetIntSlice(HiddenLayers, []int{1, 2, 3}))
-	// Normal case
-	p[HiddenLayers] = []int{4, 5, 6}
-	assert.Equal(t, []int{4, 5, 6}, p.GetIntSlice(HiddenLayers, []int{1, 2, 3}))
-	// Wrong type case
-	p[HiddenLayers] = []string{"hello"}
-	assert.Equal(t, []int{1, 2, 3}, p.GetIntSlice(HiddenLayers, []int{1, 2, 3}))
 }
 
 func TestParams_Overwrite(t *testing.T) {

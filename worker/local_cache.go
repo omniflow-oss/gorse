@@ -17,10 +17,9 @@ package worker
 import (
 	"encoding/gob"
 	std_errors "errors"
+	"github.com/juju/errors"
 	"os"
 	"path/filepath"
-
-	"github.com/juju/errors"
 )
 
 // LocalCache for the worker node.

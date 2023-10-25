@@ -18,15 +18,13 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"time"
-
-	mapset "github.com/deckarep/golang-set/v2"
 	"github.com/juju/errors"
+	"github.com/scylladb/go-set/strset"
 	"github.com/zhenghaoz/gorse/storage"
 	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
+	"time"
 )
 
 func feedbackKeyFromString(s string) (*FeedbackKey, error) {
@@ -40,29 +38,16 @@ func (k *FeedbackKey) toString() (string, error) {
 	return string(b), err
 }
 
-func unpack(o any) any {
-	if o == nil {
-		return nil
-	}
-	switch p := o.(type) {
-	case primitive.A:
-		return []any(p)
-	case primitive.D:
-		m := make(map[string]any)
-		for _, e := range p {
-			m[e.Key] = unpack(e.Value)
-		}
-		return m
-	default:
-		return p
-	}
-}
-
 // MongoDB is the data storage based on MongoDB.
 type MongoDB struct {
 	storage.TablePrefix
 	client *mongo.Client
 	dbName string
+}
+
+// Optimize is used by ClickHouse only.
+func (db *MongoDB) Optimize() error {
+	return nil
 }
 
 // Init collections and indices in MongoDB.
@@ -202,7 +187,6 @@ func (db *MongoDB) BatchGetItems(ctx context.Context, itemIds []string) ([]Item,
 		if err = r.Decode(&item); err != nil {
 			return nil, errors.Trace(err)
 		}
-		item.Labels = unpack(item.Labels)
 		items = append(items, item)
 	}
 	return items, nil
@@ -256,7 +240,6 @@ func (db *MongoDB) GetItem(ctx context.Context, itemId string) (item Item, err e
 		return
 	}
 	err = r.Decode(&item)
-	item.Labels = unpack(item.Labels)
 	return
 }
 
@@ -286,7 +269,6 @@ func (db *MongoDB) GetItems(ctx context.Context, cursor string, n int, timeLimit
 		if err = r.Decode(&item); err != nil {
 			return "", nil, err
 		}
-		item.Labels = unpack(item.Labels)
 		items = append(items, item)
 	}
 	if len(items) == n {
@@ -326,7 +308,6 @@ func (db *MongoDB) GetItemStream(ctx context.Context, batchSize int, timeLimit *
 				errChan <- errors.Trace(err)
 				return
 			}
-			item.Labels = unpack(item.Labels)
 			items = append(items, item)
 			if len(items) == batchSize {
 				itemChan <- items
@@ -428,7 +409,6 @@ func (db *MongoDB) GetUser(ctx context.Context, userId string) (user User, err e
 		return
 	}
 	err = r.Decode(&user)
-	user.Labels = unpack(user.Labels)
 	return
 }
 
@@ -454,7 +434,6 @@ func (db *MongoDB) GetUsers(ctx context.Context, cursor string, n int) (string, 
 		if err = r.Decode(&user); err != nil {
 			return "", nil, err
 		}
-		user.Labels = unpack(user.Labels)
 		users = append(users, user)
 	}
 	if len(users) == n {
@@ -489,7 +468,6 @@ func (db *MongoDB) GetUserStream(ctx context.Context, batchSize int) (chan []Use
 				errChan <- errors.Trace(err)
 				return
 			}
-			user.Labels = unpack(user.Labels)
 			users = append(users, user)
 			if len(users) == batchSize {
 				userChan <- users
@@ -541,14 +519,14 @@ func (db *MongoDB) BatchInsertFeedback(ctx context.Context, feedback []Feedback,
 		return nil
 	}
 	// collect users and items
-	users := mapset.NewSet[string]()
-	items := mapset.NewSet[string]()
+	users := strset.New()
+	items := strset.New()
 	for _, v := range feedback {
 		users.Add(v.UserId)
 		items.Add(v.ItemId)
 	}
 	// insert users
-	userList := users.ToSlice()
+	userList := users.List()
 	if insertUser {
 		var models []mongo.WriteModel
 		for _, userId := range userList {
@@ -575,7 +553,7 @@ func (db *MongoDB) BatchInsertFeedback(ctx context.Context, feedback []Feedback,
 		}
 	}
 	// insert items
-	itemList := items.ToSlice()
+	itemList := items.List()
 	if insertItem {
 		var models []mongo.WriteModel
 		for _, itemId := range itemList {
@@ -605,7 +583,7 @@ func (db *MongoDB) BatchInsertFeedback(ctx context.Context, feedback []Feedback,
 	c := db.client.Database(db.dbName).Collection(db.FeedbackTable())
 	var models []mongo.WriteModel
 	for _, f := range feedback {
-		if users.Contains(f.UserId) && items.Contains(f.ItemId) {
+		if users.Has(f.UserId) && items.Has(f.ItemId) {
 			model := mongo.NewUpdateOneModel().
 				SetUpsert(true).
 				SetFilter(bson.M{
@@ -683,8 +661,7 @@ func (db *MongoDB) GetFeedback(ctx context.Context, cursor string, n int, beginT
 }
 
 // GetFeedbackStream reads feedback from MongoDB by stream.
-func (db *MongoDB) GetFeedbackStream(ctx context.Context, batchSize int, scanOptions ...ScanOption) (chan []Feedback, chan error) {
-	scan := NewScanOptions(scanOptions...)
+func (db *MongoDB) GetFeedbackStream(ctx context.Context, batchSize int, beginTime, endTime *time.Time, feedbackTypes ...string) (chan []Feedback, chan error) {
 	feedbackChan := make(chan []Feedback, bufSize)
 	errChan := make(chan error, 1)
 	go func() {
@@ -696,32 +673,18 @@ func (db *MongoDB) GetFeedbackStream(ctx context.Context, batchSize int, scanOpt
 		opt := options.Find()
 		filter := make(bson.M)
 		// pass feedback type to filter
-		if len(scan.FeedbackTypes) > 0 {
-			filter["feedbackkey.feedbacktype"] = bson.M{"$in": scan.FeedbackTypes}
+		if len(feedbackTypes) > 0 {
+			filter["feedbackkey.feedbacktype"] = bson.M{"$in": feedbackTypes}
 		}
 		// pass time limit to filter
-		if scan.BeginTime != nil || scan.EndTime != nil {
-			timestampConditions := bson.M{}
-			if scan.BeginTime != nil {
-				timestampConditions["$gt"] = *scan.BeginTime
-			}
-			if scan.EndTime != nil {
-				timestampConditions["$lte"] = *scan.EndTime
-			}
-			filter["timestamp"] = timestampConditions
+		timestampConditions := bson.M{}
+		if beginTime != nil {
+			timestampConditions["$gt"] = *beginTime
 		}
-		// pass user id to filter
-		if scan.BeginUserId != nil || scan.EndUserId != nil {
-			userIdConditions := bson.M{}
-			if scan.BeginUserId != nil {
-				userIdConditions["$gte"] = *scan.BeginUserId
-			}
-			if scan.EndUserId != nil {
-				userIdConditions["$lte"] = *scan.EndUserId
-			}
-			filter["feedbackkey.userid"] = userIdConditions
+		if endTime != nil {
+			timestampConditions["$lte"] = *endTime
 		}
-
+		filter["timestamp"] = timestampConditions
 		r, err := c.Find(ctx, filter, opt)
 		if err != nil {
 			errChan <- errors.Trace(err)

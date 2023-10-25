@@ -14,9 +14,8 @@
 package floats
 
 import (
-	"testing"
-
 	"github.com/stretchr/testify/assert"
+	"testing"
 )
 
 func TestMatZero(t *testing.T) {
@@ -121,18 +120,6 @@ func TestAddTo(t *testing.T) {
 	AddTo(a, b, dst)
 	assert.Equal(t, target, dst)
 	assert.Panics(t, func() { AddTo(nil, nil, dst) })
-}
-
-func TestAddConst(t *testing.T) {
-	a := []float32{1, 2, 3, 4}
-	AddConst(a, 2)
-	assert.Equal(t, []float32{3, 4, 5, 6}, a)
-}
-
-func TestSqrt(t *testing.T) {
-	a := []float32{1, 4, 9, 16}
-	Sqrt(a)
-	assert.Equal(t, []float32{1, 2, 3, 4}, a)
 }
 
 func TestDot(t *testing.T) {

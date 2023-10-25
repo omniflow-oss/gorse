@@ -16,9 +16,6 @@ package storage
 
 import (
 	"database/sql"
-	"net/url"
-	"strings"
-
 	"github.com/go-sql-driver/mysql"
 	"github.com/juju/errors"
 	"github.com/samber/lo"
@@ -26,17 +23,24 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/schema"
 	"moul.io/zapgorm2"
+	"net/url"
+	"strings"
 )
 
 const (
-	MySQLPrefix      = "mysql://"
-	MongoPrefix      = "mongodb://"
-	MongoSrvPrefix   = "mongodb+srv://"
-	PostgresPrefix   = "postgres://"
-	PostgreSQLPrefix = "postgresql://"
-	SQLitePrefix     = "sqlite://"
-	RedisPrefix      = "redis://"
-	RedissPrefix     = "rediss://"
+	MySQLPrefix        = "mysql://"
+	MongoPrefix        = "mongodb://"
+	MongoSrvPrefix     = "mongodb+srv://"
+	PostgresPrefix     = "postgres://"
+	PostgreSQLPrefix   = "postgresql://"
+	ClickhousePrefix   = "clickhouse://"
+	CHHTTPPrefix       = "chhttp://"
+	CHHTTPSPrefix      = "chhttps://"
+	SQLitePrefix       = "sqlite://"
+	RedisPrefix        = "redis://"
+	RedissPrefix       = "rediss://"
+	RedisClusterPrefix = "redis+cluster://"
+	OraclePrefix       = "oracle://"
 )
 
 func AppendURLParams(rawURL string, params []lo.Tuple2[string, string]) (string, error) {
@@ -98,16 +102,8 @@ func (tp TablePrefix) SetsTable() string {
 	return string(tp) + "sets"
 }
 
-func (tp TablePrefix) MessageTable() string {
-	return string(tp) + "message"
-}
-
-func (tp TablePrefix) DocumentTable() string {
-	return string(tp) + "documents"
-}
-
-func (tp TablePrefix) PointsTable() string {
-	return string(tp) + "time_series_points"
+func (tp TablePrefix) SortedSetsTable() string {
+	return string(tp) + "sorted_sets"
 }
 
 func (tp TablePrefix) UsersTable() string {
@@ -137,12 +133,13 @@ func NewGORMConfig(tablePrefix string) *gorm.Config {
 			NameReplacer: strings.NewReplacer(
 				"SQLValue", "Values",
 				"SQLSet", "Sets",
+				"SQLSortedSet", "SortedSets",
 				"SQLUser", "Users",
 				"SQLItem", "Items",
 				"SQLFeedback", "Feedback",
-				"SQLDocument", "Documents",
-				"PostgresDocument", "Documents",
-				"TimeSeriesPoint", "time_series_points",
+				"ClickhouseUser", "Users",
+				"ClickHouseItem", "Items",
+				"ClickHouseFeedback", "Feedback",
 			),
 		},
 	}
