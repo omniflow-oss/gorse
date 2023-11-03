@@ -17,6 +17,7 @@ package search
 import (
 	"math"
 	"math/rand"
+	"strconv"
 	"sync"
 	"time"
 
@@ -219,10 +220,17 @@ func (idx *IVF) Build() {
 				if nextCluster != assignments[i] {
 					errorCount.Inc()
 				}
-				nextClusters[nextCluster].mu.Lock()
-				defer nextClusters[nextCluster].mu.Unlock()
-				nextClusters[nextCluster].observations = append(nextClusters[nextCluster].observations, int32(i))
-				assignments[i] = nextCluster
+				if nextCluster != -1 && nextCluster < len(nextClusters) {
+					nextClusters[nextCluster].mu.Lock()
+					defer nextClusters[nextCluster].mu.Unlock()
+					nextClusters[nextCluster].observations = append(nextClusters[nextCluster].observations, int32(i))
+					assignments[i] = nextCluster
+				} else {
+					errorCount.Inc()
+					log.Logger().Warn("nextClusters[nextCluster] out of rang")
+					log.Logger().Debug(strconv.Itoa(len(nextClusters)))
+					log.Logger().Debug(strconv.Itoa(nextCluster))
+				}
 			}
 			return nil
 		})
