@@ -15,6 +15,7 @@
 package search
 
 import (
+	"github.com/chewxy/math32"
 	"github.com/zhenghaoz/gorse/base/heap"
 )
 
