@@ -40,7 +40,9 @@ func (b *Bruteforce) Search(q Vector, n int, prune0 bool) (values []int32, score
 	pq := heap.NewPriorityQueue(true)
 	for i, vec := range b.vectors {
 		if vec != q {
-			pq.Push(int32(i), q.Distance(vec))
+			if !math32.IsNaN(q.Distance(vec)) {
+				pq.Push(int32(i), q.Distance(vec))
+			}
 			if pq.Len() > n {
 				pq.Pop()
 			}
